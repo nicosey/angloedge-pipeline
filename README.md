@@ -1,6 +1,6 @@
-# briefing
+# angloedge-pipeline
 
-A lightweight daily news briefing pipeline. Searches for recent news via [SearXNG](https://github.com/searxng/searxng), generates AI outputs via [Ollama](https://ollama.com), saves to SQLite, and publishes to Telegram.
+A lightweight daily news briefing pipeline powering [AngloEdge](https://angloedge.com). Searches for recent news via [SearXNG](https://github.com/searxng/searxng), generates AI outputs via [Ollama](https://ollama.com), saves to SQLite, and publishes to Telegram and GitHub.
 
 ## How it works
 
