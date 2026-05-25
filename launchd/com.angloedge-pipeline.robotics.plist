@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.briefing.robotics</string>
+    <string>com.angloedge-pipeline.robotics</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd /Users/m4server/projects/briefing && python3 briefing.py robotics && python3 publish.py</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline && python3 briefing.py robotics && python3 publish.py</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -21,9 +21,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/m4server/projects/briefing/logs/robotics.log</string>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/robotics.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/m4server/projects/briefing/logs/robotics.log</string>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/robotics.log</string>
 
     <key>RunAtLoad</key>
     <false/>
