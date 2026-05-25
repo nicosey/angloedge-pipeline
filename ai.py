@@ -309,7 +309,18 @@ Insight style: specific and sharp — cite sector trends, recent precedents, or 
 """
 
 
-def _parse_enrichment_json(text):
+# Minimum impact_score by category — catches obvious model under-scoring
+_SCORE_FLOORS = {
+    "Acquisition":     6,
+    "Results":         5,
+    "Trading Update":  4,
+    "Placing":         4,
+    "Director Dealing": 3,
+    "Share Buyback":   3,
+}
+
+
+def _parse_enrichment_json(text, category=""):
     """Extract the first JSON object from model output. Returns dict or None."""
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if not m:
@@ -321,6 +332,10 @@ def _parse_enrichment_json(text):
         themes = data.get("key_themes", [])
         if not isinstance(score, int) or not (1 <= score <= 10):
             return None
+        floor = _SCORE_FLOORS.get(category, 1)
+        if score < floor:
+            log(f"    ⚠ score {score} below floor {floor} for {category!r} — clamping")
+            score = floor
         if not isinstance(themes, list):
             themes = [themes] if themes else []
         return {
@@ -355,7 +370,7 @@ def enrich_rns_with_llm(announcements, dry_run=False):
             log("    ⚠ No response, skipping")
             continue
 
-        enrichment = _parse_enrichment_json(raw)
+        enrichment = _parse_enrichment_json(raw, category=ann.get("category", ""))
         if not enrichment:
             log(f"    ⚠ Could not parse JSON: {raw[:80]!r}")
             continue
