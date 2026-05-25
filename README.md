@@ -44,7 +44,13 @@ The `--full-day` flag tells the briefing to use all collections since midnight r
 - [Ollama](https://ollama.com) running locally with a model pulled
 - For Telegram delivery: a bot token and chat ID
 
-No third-party Python packages required — uses only the standard library.
+No third-party Python packages required for the core pipeline — uses only the standard library.
+
+RNS collection (`collect.py --rns`) additionally requires:
+
+```bash
+pip install requests beautifulsoup4
+```
 
 ## Setup
 
@@ -83,6 +89,12 @@ BRIEFING_ARCHIVE_DB=output/archive.db
 # Collect latest news for a topic (run hourly)
 python3 collect.py <topic>
 
+# Collect RNS announcements from Investegate
+python3 collect.py --rns
+
+# Collect both SearXNG news and RNS in one run
+python3 collect.py --all <topic>
+
 # Generate a briefing from collected data and queue for delivery
 python3 briefing.py <topic> [options]
 
@@ -104,6 +116,8 @@ python3 research.py [options]
 | Option | Description |
 | --- | --- |
 | `--mock` | Fake SearXNG — no services needed |
+| `--rns` | Collect RNS announcements from Investegate instead of SearXNG news |
+| `--all` | Collect SearXNG news for `<topic>` then collect RNS (requires a topic argument) |
 
 ### briefing.py options
 
@@ -322,6 +336,7 @@ Results are stored in `output/briefings.db` (SQLite — no server required):
 | `runs` | One row per briefing run: topic, timestamp, raw headlines, aggregation state |
 | `outputs` | One row per AI output per run: type, name, content — kept permanently |
 | `outbox` | Delivery queue: one row per output×destination. Undelivered entries are retried on every publish run. Published entries older than 24 hours are cleaned up automatically. |
+| `rns_announcements` | RNS announcements scraped from Investegate — one row per announcement, deduplicated by Investegate's numeric ID (`rns_number`). Kept permanently. |
 
 ## Scheduling on macOS (launchd)
 
@@ -329,20 +344,83 @@ Results are stored in `output/briefings.db` (SQLite — no server required):
 
 | Job | Schedule | Command |
 | --- | --- | --- |
-| `com.briefing.uk_capital_markets_collect` | Hourly 7am–5pm | `collect.sh uk_capital_markets` |
-| `com.briefing.uk_capital_markets` | 7am daily | `run.sh uk_capital_markets --briefing-type morning` |
-| `com.briefing.uk_capital_markets_digest` | 12pm daily | `run.sh uk_capital_markets --briefing-type midday` |
-| `com.briefing.uk_capital_markets_eod` | 5pm daily | `run.sh uk_capital_markets --briefing-type eod --full-day` |
+| `com.angloedge.uk_capital_markets_collect` | Hourly 7am–5pm | `collect.sh uk_capital_markets` |
+| `com.angloedge.uk_capital_markets` | 7am daily | `run.sh uk_capital_markets --briefing-type morning` |
+| `com.angloedge.uk_capital_markets_digest` | 12pm daily | `run.sh uk_capital_markets --briefing-type midday` |
+| `com.angloedge.uk_capital_markets_eod` | 5pm daily | `run.sh uk_capital_markets --briefing-type eod --full-day` |
 
 ### Robotics
 
 | Job | Schedule | Command |
 | --- | --- | --- |
-| `com.briefing.robotics` | 6pm daily | `briefing.py robotics && publish.py` |
+| `com.angloedge.robotics` | 6pm daily | `briefing.py robotics && publish.py` |
+
+### RNS announcements
+
+| Job | Schedule | Command |
+| --- | --- | --- |
+| `com.angloedge.rns` | Every 30 min, 7am–4:30pm | `collect.py --rns` |
+
+`collect.py --rns` scrapes the [Investegate](https://www.investegate.co.uk) announcement listing, parses each row into structured fields, and inserts new entries into the `rns_announcements` table. Duplicates are skipped automatically using Investegate's numeric announcement ID as a unique key, so the job is safe to run frequently.
+
+Fields collected per announcement: `timestamp`, `company_name`, `ticker`, `headline`, `url`, `category` (inferred from headline keywords), and `rns_number` (Investegate's internal numeric ID, used for deduplication).
+
+**Install dependencies before first run:**
+
+```bash
+pip install requests beautifulsoup4
+```
+
+**Load the job:**
+
+```bash
+cp launchd/com.angloedge.rns.plist ~/Library/LaunchAgents/
+# Edit the plist to replace the project path if not using /Users/m4server/projects/angloedge-pipeline
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.angloedge.rns.plist
+launchctl list | grep angloedge.rns
+```
+
+**Query the collected data:**
+
+```bash
+sqlite3 output/briefings.db "SELECT timestamp, ticker, company_name, category, headline FROM rns_announcements ORDER BY timestamp DESC LIMIT 20;"
+```
+
+### Smart RNS enrichment
+
+Raw RNS data is just a headline and a category. The enrichment layer sends high-signal announcements to Ollama and writes three additional fields back to the database:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `impact_score` | INTEGER 1–10 | Market significance (8–10 = transformative, 5–7 = notable, 1–4 = routine) |
+| `insight` | TEXT | 1–2 sentence sharp commentary: why it matters, sector context, precedents |
+| `key_themes` | TEXT (JSON) | List of tags, e.g. `["M&A", "Insurance", "Foreign Takeover"]` |
+
+Only **high-signal categories** are enriched (Results, Acquisition, Trading Update, Placing, Director Dealing, Share Buyback). Routine categories (AGM/EGM, Dividend) are skipped to keep Ollama load low.
+
+**Run enrichment standalone:**
+
+```bash
+python3 process_rns.py             # enrich up to 50 unenriched announcements
+python3 process_rns.py --limit 10  # process at most 10
+python3 process_rns.py --dry-run   # preview without calling Ollama
+```
+
+**Collect and enrich in one step:**
+
+```bash
+python3 collect.py --rns --enrich
+```
+
+**Query enriched announcements:**
+
+```bash
+sqlite3 output/briefings.db "SELECT ticker, impact_score, key_themes, insight FROM rns_announcements WHERE impact_score IS NOT NULL ORDER BY impact_score DESC, timestamp DESC LIMIT 10;"
+```
 
 ### Plist template
 
-Save as `~/Library/LaunchAgents/com.briefing.LABEL.plist`, replacing `YOUR_USER`:
+Save as `~/Library/LaunchAgents/com.angloedge.LABEL.plist`, replacing `YOUR_USER`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -351,11 +429,11 @@ Save as `~/Library/LaunchAgents/com.briefing.LABEL.plist`, replacing `YOUR_USER`
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.briefing.LABEL</string>
+    <string>com.angloedge.LABEL</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOUR_USER/projects/briefing/run.sh</string>
+        <string>/Users/YOUR_USER/projects/angloedge-pipeline/run.sh</string>
         <string>TOPIC</string>
         <string>--briefing-type</string>
         <string>morning</string>
@@ -368,9 +446,9 @@ Save as `~/Library/LaunchAgents/com.briefing.LABEL.plist`, replacing `YOUR_USER`
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/YOUR_USER/projects/briefing/output/LABEL.log</string>
+    <string>/Users/YOUR_USER/projects/angloedge-pipeline/output/LABEL.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USER/projects/briefing/output/LABEL.error.log</string>
+    <string>/Users/YOUR_USER/projects/angloedge-pipeline/output/LABEL.error.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -384,10 +462,10 @@ Save as `~/Library/LaunchAgents/com.briefing.LABEL.plist`, replacing `YOUR_USER`
 ### Load and test
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.briefing.LABEL.plist
-launchctl list | grep briefing
-launchctl start com.briefing.LABEL
-tail -f ~/projects/briefing/output/LABEL.log
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.angloedge.LABEL.plist
+launchctl list | grep angloedge
+launchctl start com.angloedge.LABEL
+tail -f ~/projects/angloedge-pipeline/output/LABEL.log
 ```
 
 ### Notes

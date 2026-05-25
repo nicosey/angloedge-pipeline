@@ -106,6 +106,34 @@ def init_db():
                 results   TEXT NOT NULL
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS rns_announcements (
+                id           INTEGER PRIMARY KEY,
+                rns_number   TEXT UNIQUE,
+                timestamp    TEXT,
+                company_name TEXT,
+                ticker       TEXT,
+                headline     TEXT,
+                url          TEXT,
+                category     TEXT,
+                collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                impact_score INTEGER,
+                insight      TEXT,
+                key_themes   TEXT,
+                enriched_at  TEXT
+            )
+        """)
+        # Migration: add enrichment columns to existing DBs that predate this schema
+        for col_def in (
+            "ADD COLUMN impact_score INTEGER",
+            "ADD COLUMN insight TEXT",
+            "ADD COLUMN key_themes TEXT",
+            "ADD COLUMN enriched_at TEXT",
+        ):
+            try:
+                con.execute(f"ALTER TABLE rns_announcements {col_def}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         con.commit()
         con.close()
     _db_op(_)
@@ -382,4 +410,89 @@ def cleanup_collections(max_age_hours=48):
         con.close()
         if count:
             log(f"  🗄  DB: cleaned up {count} old collection(s)")
+    _db_op(_)
+
+
+# Categories considered high-signal for LLM enrichment (skip routine/admin ones)
+_HIGH_SIGNAL_CATEGORIES = {"Results", "Acquisition", "Trading Update", "Placing", "Director Dealing", "Share Buyback"}
+
+
+def save_rns_announcements(announcements):
+    """
+    Insert RNS announcements, skipping any whose rns_number already exists.
+    Returns the count of newly inserted rows.
+    """
+    def _():
+        con = _connect()
+        saved = 0
+        for ann in announcements:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO rns_announcements "
+                "(rns_number, timestamp, company_name, ticker, headline, url, category) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ann["rns_number"],
+                    ann["timestamp"],
+                    ann["company_name"],
+                    ann["ticker"],
+                    ann["headline"],
+                    ann["url"],
+                    ann["category"],
+                ),
+            )
+            saved += cur.rowcount
+        con.commit()
+        con.close()
+        if saved:
+            log(f"  🗄  DB: saved {saved} new RNS announcement(s)")
+        return saved
+    return _db_op(_)
+
+
+def get_unenriched_rns(limit=50):
+    """Return high-signal RNS rows not yet enriched, newest first."""
+    def _():
+        con = _connect()
+        placeholders = ",".join("?" * len(_HIGH_SIGNAL_CATEGORIES))
+        rows = con.execute(
+            f"SELECT rns_number, timestamp, company_name, ticker, headline, url, category "
+            f"FROM rns_announcements "
+            f"WHERE impact_score IS NULL AND category IN ({placeholders}) "
+            f"ORDER BY timestamp DESC LIMIT ?",
+            (*_HIGH_SIGNAL_CATEGORIES, limit),
+        ).fetchall()
+        con.close()
+        return [
+            {
+                "rns_number":   r[0],
+                "timestamp":    r[1],
+                "company_name": r[2],
+                "ticker":       r[3],
+                "headline":     r[4],
+                "url":          r[5],
+                "category":     r[6],
+            }
+            for r in rows
+        ]
+    return _db_op(_)
+
+
+def update_rns_enrichment(rns_number, impact_score, insight, key_themes):
+    """Write LLM enrichment fields back to an rns_announcements row."""
+    def _():
+        con = _connect()
+        con.execute(
+            "UPDATE rns_announcements "
+            "SET impact_score=?, insight=?, key_themes=?, enriched_at=? "
+            "WHERE rns_number=?",
+            (
+                impact_score,
+                insight,
+                json.dumps(key_themes) if isinstance(key_themes, list) else key_themes,
+                datetime.now().isoformat(timespec="seconds"),
+                rns_number,
+            ),
+        )
+        con.commit()
+        con.close()
     _db_op(_)

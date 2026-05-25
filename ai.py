@@ -1,4 +1,5 @@
 import json
+import re
 import urllib.request
 
 from config import OLLAMA_URL, OLLAMA_MODEL, log
@@ -186,7 +187,6 @@ def _generate_thread_from_paragraphs(output_cfg, source_content, cfg):
     numbered  = output_cfg.get("numbered", True)
 
     # Split on double or single newlines for resilience against inconsistent AI output
-    import re
     raw = [p.strip() for p in re.split(r'\n\n+|\n', source_content) if p.strip()]
     if not raw:
         return None
@@ -282,6 +282,88 @@ _MOCK_NARRATIVE = (
     "This follows a pattern seen in previous quarters and may signal a broader shift.\n\n"
     "Watch for follow-up developments over the next 24 hours as the situation evolves."
 )
+
+
+_RNS_ENRICH_PROMPT = """\
+You are a sharp, market-savvy financial analyst specialising in UK equity markets.
+
+Analyse this RNS announcement and respond with ONLY a valid JSON object — no explanation, no preamble, no markdown.
+
+Company: {company} ({ticker})
+Category: {category}
+Headline: {headline}
+
+Required JSON format:
+{{
+  "impact_score": <integer 1-10>,
+  "insight": "<1-2 sentences: specific commentary — why this matters, any sector context, precedent or implication>",
+  "key_themes": ["<tag1>", "<tag2>"]
+}}
+
+Scoring guide:
+- 8-10: Transformative (major M&A, significant profit warning, CEO departure, large capital raise)
+- 5-7:  Notable but routine (interim results, moderate trading update, minor capital action)
+- 1-4:  Minor/administrative (small buyback tranche, routine director dealing)
+
+Insight style: specific and sharp — cite sector trends, recent precedents, or strategic implications. Never generic.\
+"""
+
+
+def _parse_enrichment_json(text):
+    """Extract the first JSON object from model output. Returns dict or None."""
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group())
+        score = data.get("impact_score")
+        insight = data.get("insight", "")
+        themes = data.get("key_themes", [])
+        if not isinstance(score, int) or not (1 <= score <= 10):
+            return None
+        if not isinstance(themes, list):
+            themes = [themes] if themes else []
+        return {
+            "impact_score": score,
+            "insight":      str(insight).strip(),
+            "key_themes":   [str(t).strip() for t in themes if t],
+        }
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def enrich_rns_with_llm(announcements, dry_run=False):
+    """
+    Enrich RNS announcement dicts with LLM-generated impact_score, insight, and key_themes.
+    Returns list of (rns_number, enrichment_dict) tuples for successfully enriched entries.
+    """
+    results = []
+    for ann in announcements:
+        prompt = _RNS_ENRICH_PROMPT.format(
+            company=ann.get("company_name", "Unknown"),
+            ticker=ann.get("ticker", "—"),
+            category=ann.get("category", "Other"),
+            headline=ann["headline"],
+        )
+        if dry_run:
+            log(f"  [DRY RUN] Would enrich: {ann['headline'][:70]}")
+            continue
+
+        log(f"  🔍 {ann['company_name']} ({ann['ticker']}) — {ann['headline'][:55]}...")
+        raw = _ollama_call(prompt, max_tokens=300)
+        if not raw:
+            log("    ⚠ No response, skipping")
+            continue
+
+        enrichment = _parse_enrichment_json(raw)
+        if not enrichment:
+            log(f"    ⚠ Could not parse JSON: {raw[:80]!r}")
+            continue
+
+        log(f"    ✅ score={enrichment['impact_score']} themes={enrichment['key_themes']}")
+        results.append((ann["rns_number"], enrichment))
+
+    return results
 
 
 def mock_output(output_cfg, cfg, source_content=None):
