@@ -123,12 +123,13 @@ def init_db():
                 enriched_at  TEXT
             )
         """)
-        # Migration: add enrichment columns to existing DBs that predate this schema
+        # Migration: add columns to existing DBs that predate this schema
         for col_def in (
             "ADD COLUMN impact_score INTEGER",
             "ADD COLUMN insight TEXT",
             "ADD COLUMN key_themes TEXT",
             "ADD COLUMN enriched_at TEXT",
+            "ADD COLUMN telegram_published_at TEXT",
         ):
             try:
                 con.execute(f"ALTER TABLE rns_announcements {col_def}")
@@ -475,6 +476,51 @@ def get_unenriched_rns(limit=50):
             for r in rows
         ]
     return _db_op(_)
+
+
+def get_unpublished_enriched_rns(min_score=1):
+    """Return enriched RNS rows not yet sent to Telegram, highest impact first."""
+    def _():
+        con = _connect()
+        rows = con.execute(
+            "SELECT rns_number, timestamp, company_name, ticker, headline, url, "
+            "       category, impact_score, insight, key_themes "
+            "FROM rns_announcements "
+            "WHERE impact_score IS NOT NULL AND telegram_published_at IS NULL "
+            "  AND impact_score >= ? "
+            "ORDER BY impact_score DESC, timestamp DESC",
+            (min_score,),
+        ).fetchall()
+        con.close()
+        return [
+            {
+                "rns_number":   r[0],
+                "timestamp":    r[1],
+                "company_name": r[2],
+                "ticker":       r[3],
+                "headline":     r[4],
+                "url":          r[5],
+                "category":     r[6],
+                "impact_score": r[7],
+                "insight":      r[8],
+                "key_themes":   json.loads(r[9]) if r[9] else [],
+            }
+            for r in rows
+        ]
+    return _db_op(_)
+
+
+def mark_rns_published(rns_number):
+    """Record that an RNS announcement has been sent to Telegram."""
+    def _():
+        con = _connect()
+        con.execute(
+            "UPDATE rns_announcements SET telegram_published_at=? WHERE rns_number=?",
+            (datetime.now().isoformat(timespec="seconds"), rns_number),
+        )
+        con.commit()
+        con.close()
+    _db_op(_)
 
 
 def update_rns_enrichment(rns_number, impact_score, insight, key_themes):
