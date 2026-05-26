@@ -9,7 +9,7 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd /Users/m4server/projects/angloedge-pipeline && python3 collect.py --rns && python3 process_rns.py && python3 process_rns.py --publish</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 collect.py --rns && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 process_rns.py && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 process_rns.py --publish</string>
     </array>
 
     <!-- Every 30 minutes, 07:00–16:30 UK time (covers pre-market through LSE close) -->
