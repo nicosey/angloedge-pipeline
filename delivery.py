@@ -20,7 +20,7 @@ class Delivery:
     def send_long(self, message):
         """Send a message that may exceed the destination's size limit.
         Default: single send. Override if chunking is needed."""
-        self.send(message)
+        return self.send(message)
 
 
 # ── telegram ─────────────────────────────────────────────────
