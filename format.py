@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 
-from config import OLLAMA_MODEL
+from config import OLLAMA_BRIEFING_MODEL
 
 # Destinations that receive markdown-formatted content instead of HTML
 MARKDOWN_DESTS = {"markdown", "github"}
@@ -150,7 +150,7 @@ def build_markdown_message(content, output_cfg, cfg):
         f'description: "{description}"\n'
         f"pubDate: {now.strftime('%Y-%m-%dT%H:%M:%S')}\n"
         f"topic: {topic}\n"
-        f'model: "{OLLAMA_MODEL}"\n'
+        f'model: "{OLLAMA_BRIEFING_MODEL}"\n'
         f"---\n\n"
         f"{content}\n"
     )
@@ -175,5 +175,5 @@ def build_output_message(content, output_cfg, cfg):
         f'{"─" * 30}\n\n'
         f'{content}\n\n'
         f'{"─" * 30}\n'
-        f'🧠 <i>Written by {OLLAMA_MODEL}</i>'
+        f'🧠 <i>Written by {OLLAMA_BRIEFING_MODEL}</i>'
     )

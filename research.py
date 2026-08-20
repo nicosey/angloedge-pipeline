@@ -21,7 +21,7 @@ import sqlite3
 import urllib.request
 from datetime import datetime
 
-from config import OLLAMA_URL, OLLAMA_MODEL, ARCHIVE_DB_PATH, DB_PATH, log
+from config import OLLAMA_URL, OLLAMA_BRIEFING_MODEL, ARCHIVE_DB_PATH, DB_PATH, log
 from search import search_searxng
 from db import init_archive_db, save_collection
 
@@ -155,7 +155,7 @@ Research summary:"""
 
     log("\n🧠 Analysing with Ollama...\n")
     payload = json.dumps({
-        "model":   OLLAMA_MODEL,
+        "model":   OLLAMA_BRIEFING_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream":  False,
         "think":   False,

@@ -20,8 +20,8 @@ _load_env()
 
 SEARXNG_URL        = os.environ.get("SEARXNG_URL", "http://localhost:8888")
 OLLAMA_URL         = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL       = os.environ.get("OLLAMA_MODEL", "qwen3-coder:30b")
-OLLAMA_MODEL_RNS   = os.environ.get("OLLAMA_MODEL_RNS", OLLAMA_MODEL)
+OLLAMA_BRIEFING_MODEL = os.environ.get("OLLAMA_BRIEFING_MODEL", os.environ.get("OLLAMA_MODEL", "qwen3-coder:30b"))
+OLLAMA_ENRICH_MODEL   = os.environ.get("OLLAMA_ENRICH_MODEL",   OLLAMA_BRIEFING_MODEL)
 DB_PATH            = os.environ.get("BRIEFING_DB",  os.path.join("output", "briefings.db"))
 ARCHIVE_DB_PATH    = os.environ.get("BRIEFING_ARCHIVE_DB", os.path.join("output", "archive.db"))
 

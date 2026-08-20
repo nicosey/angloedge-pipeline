@@ -2,7 +2,7 @@ import json
 import re
 import urllib.request
 
-from config import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_MODEL_RNS, log
+from config import OLLAMA_URL, OLLAMA_BRIEFING_MODEL, OLLAMA_ENRICH_MODEL, log
 
 
 # ── prompt builders ──────────────────────────────────────────
@@ -140,7 +140,7 @@ _PROMPT_BUILDERS = {
 def _ollama_call(prompt, max_tokens=500, model=None):
     """Single Ollama call, returns stripped text or None."""
     payload = json.dumps({
-        "model": model or OLLAMA_MODEL,
+        "model": model or OLLAMA_BRIEFING_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "think": False,
@@ -247,7 +247,7 @@ def generate_output(output_cfg, results_data, cfg, previous_narratives=None, sou
     else:
         prompt  = builder(output_cfg, results_data, cfg, previous_narratives)
     payload = json.dumps({
-        "model": OLLAMA_MODEL,
+        "model": OLLAMA_BRIEFING_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "think": False,
@@ -365,7 +365,7 @@ def enrich_rns_with_llm(announcements, dry_run=False):
             continue
 
         log(f"  🔍 {ann['company_name']} ({ann['ticker']}) — {ann['headline'][:55]}...")
-        raw = _ollama_call(prompt, max_tokens=300, model=OLLAMA_MODEL_RNS)
+        raw = _ollama_call(prompt, max_tokens=300, model=OLLAMA_ENRICH_MODEL)
         if not raw:
             log("    ⚠ No response, skipping")
             continue
