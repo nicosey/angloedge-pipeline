@@ -416,6 +416,13 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     map_path      = os.path.join(repo_path, map_rel)
     tag           = " [DRY RUN]" if dry_run else ""
 
+    # Start from origin's current state so the slug map and files we compare
+    # against are the latest (e.g. hand-corrected slugs). A stale clone would
+    # otherwise write old-slug files and hit rebase conflicts on push.
+    # Skipped for --dry-run (no side effects) and --limit (local test mode).
+    if not dry_run and limit is None:
+        git(repo_path, "pull", "--rebase", "--autostash", "origin", branch)
+
     groups, no_ticker, invalid_ts = group_rows(rows)
     for r in invalid_ts[:MAX_TIMESTAMP_WARNINGS]:
         log(f"  ⚠ Unparseable timestamp {r['timestamp']!r} — {r['ticker']} rns {r['rns_number']} (sorted last)")

@@ -809,8 +809,8 @@ class TestExportCompanies(unittest.TestCase):
     def test_commits_and_pushes_only_export_paths(self):
         self._run(self._rows())
         subcommands = [c.args[1] for c in self.git.call_args_list]
-        self.assertEqual(subcommands, ["add", "commit", "pull", "push"])
-        commit_args = self.git.call_args_list[1].args
+        self.assertEqual(subcommands, ["pull", "add", "commit", "pull", "push"])
+        commit_args = self.git.call_args_list[2].args
         self.assertIn(self.COMPANIES, commit_args)
         self.assertIn("--", commit_args)
 
@@ -820,7 +820,13 @@ class TestExportCompanies(unittest.TestCase):
         s = self._run(self._rows())
         self.assertEqual(s["new"] + s["changed"], 0)
         self.assertEqual(s["unchanged"], 1)
-        self.git.assert_not_called()
+        self.assertEqual([c.args[1] for c in self.git.call_args_list], ["pull"])
+
+    def test_pulls_before_reading_and_aborts_if_pull_fails(self):
+        self.git.side_effect = RuntimeError("cannot pull with rebase")
+        with self.assertRaises(RuntimeError):
+            self._run(self._rows())
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "src")))
 
     def test_slug_is_sticky_across_rename(self):
         self._run(self._rows())
