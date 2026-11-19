@@ -568,6 +568,39 @@ class TestCompanyExportHelpers(unittest.TestCase):
         for raw, expected in cases.items():
             self.assertEqual(slug_name(raw), expected, raw)
 
+    def test_slug_name_drops_repeated_short_name(self):
+        from export_companies import slug_name
+        cases = {
+            "SIEMENS AG SIEMENS N ORD SHS":  "SIEMENS",
+            "Genmab A/S Genmab Ord Shs":     "Genmab",
+            "Nordex SE Nordex Ord Shs":      "Nordex",
+            "IRISH RESIDENTIAL PROPERTIES REIT P IRISH RESIDENTIAL PROPERTIES ORD SHS":
+                                             "IRISH RESIDENTIAL PROPERTIES REIT",
+            "Mahindra & Mahindra":           "Mahindra & Mahindra",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(slug_name(raw), expected, raw)
+
+    def test_slug_name_legal_form_variants(self):
+        from export_companies import slug_name
+        cases = {
+            "Coloplast A/S B Ord Shs":                  "Coloplast",
+            "EFG-HERMES HOLDING S.A.E.":                "EFG-HERMES HOLDING",
+            "TMS ISSUER S.A.R.L.":                      "TMS ISSUER",
+            "CTS Eventim AG & Co KGAA":                 "CTS Eventim",
+            "Elecosoft Public Limited Company":         "Elecosoft",
+            "BH Macro Ltd. GBP Shares":                 "BH Macro",
+            "Fair Oaks Income Limited 2021 Shs NPV":    "Fair Oaks Income",
+            "Ruffer Investment Company Ltd Red PTG Pref Shares": "Ruffer Investment Company",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(slug_name(raw), expected, raw)
+
+    def test_share_class_words_kept_once_legal_form_stripped(self):
+        from export_companies import slug_name
+        self.assertEqual(slug_name("LEVERAGE SHARES PUBLIC LIMITED COMPANY"), "LEVERAGE SHARES")
+        self.assertEqual(slug_name("DP Aircraft I Limited Pref"), "DP Aircraft I")
+
     def test_slug_name_never_strips_to_empty(self):
         from export_companies import slug_name
         self.assertEqual(slug_name("Ord Shs"), "Ord")
@@ -721,13 +754,13 @@ class TestExportCompanies(unittest.TestCase):
 
     def test_mixed_timestamp_formats_sort_and_normalise(self):
         rows = [
-            _rns_row(1, "MIX", "2026-05-22T22:00:00", name="Mixed Co"),
-            _rns_row(2, "MIX", "21 Sep 2026 07:32 AM", name="Mixed Co"),
-            _rns_row(3, "MIX", "03 Jun 2026 04:15 PM", name="Mixed Co"),
-            _rns_row(4, "MIX", "not a date", name="Mixed Co"),
+            _rns_row(1, "MIX", "2026-05-22T22:00:00", name="Mixed Holdings"),
+            _rns_row(2, "MIX", "21 Sep 2026 07:32 AM", name="Mixed Holdings"),
+            _rns_row(3, "MIX", "03 Jun 2026 04:15 PM", name="Mixed Holdings"),
+            _rns_row(4, "MIX", "not a date", name="Mixed Holdings"),
         ]
         s = self._run(rows)
-        c = self._load(os.path.join(self.dir, "mixed-co-mix.json"))
+        c = self._load(os.path.join(self.dir, "mixed-holdings-mix.json"))
         self.assertEqual([a["timestamp"] for a in c["announcements"]],
                          ["2026-09-21T07:32:00", "2026-06-03T16:15:00",
                           "2026-05-22T22:00:00", "not a date"])

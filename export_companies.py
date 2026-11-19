@@ -38,15 +38,22 @@ MAX_TIMESTAMP_WARNINGS = 20   # cap per-row log lines; the summary has the full 
 
 # Trailing tokens removed from company names before slugifying (lowercase,
 # punctuation-stripped). Affects NEW slugs only — existing slugs are sticky.
-SLUG_STRIP_TOKENS = {
-    # share-class / listing notation
+# Names read '<name> <legal form> <share-class notation>', so stripping runs
+# from the end in two phases: share-class tokens first, then legal forms. Once a
+# legal form is stripped, share-class tokens are no longer removed — so
+# 'Leverage Shares PLC' keeps 'Shares'.
+SHARE_CLASS_TOKENS = {
     "ord", "ords", "ordinary", "shs", "sh", "shares", "share", "npv", "red", "redeemable",
     "cls", "class", "clas", "pref", "preference", "prf", "pfd", "cnv", "conv", "di",
-    "dr", "adr", "gdr", "sdr", "reg", "registered", "units", "unit", "wi", "nv", "vtg",
-    # legal forms
+    "dr", "adr", "gdr", "sdr", "reg", "registered", "units", "unit", "wi", "vtg", "ptg",
+    "gbp", "usd", "eur",   # bare currency designations ('BH Macro Ltd. GBP Shares')
+}
+LEGAL_FORM_TOKENS = {
     "plc", "limited", "ltd", "inc", "incorporated", "corp", "corporation", "llc", "lp",
     "ag", "sa", "nv", "ab", "publ", "asa", "oyj", "spa", "se", "icav", "bv",
+    "a/s", "s.a", "s.a.e", "s.a.r.l", "sarl", "n.v", "s.p.a", "kgaa", "co",
 }
+SLUG_STRIP_TOKENS = SHARE_CLASS_TOKENS | LEGAL_FORM_TOKENS
 # Nominal values such as '0.1p', '10p', 'gbp0.01', 'usd1', '€0.05'
 _NOMINAL_VALUE_RE = re.compile(r"^(?:(?:gbp|usd|eur|sek|nok|dkk|chf|£|\$|€)\d[\d.]*p?|\d+(?:\.\d+)?p)$")
 
@@ -87,27 +94,69 @@ def slug_name(company_name):
         if stripped == name or not stripped:
             break
         name = stripped
-    tokens = name.split()
+    name = re.sub(r"\bpublic\s+limited\s+company\b", "plc", name, flags=re.I)
+    tokens = _strip_trailing(name.split())
+    tokens = _drop_repeated_short_name(tokens)
+    return " ".join(tokens)
 
-    def _norm(t):
-        return t.lower().strip(".,;:&-")
 
-    def _strippable(t):
-        n = _norm(t)
-        return n in SLUG_STRIP_TOKENS or bool(_NOMINAL_VALUE_RE.match(n))
+def _norm_token(t):
+    return t.lower().strip(".,;:&-")
 
-    stripped_any = False
+
+def _is_strip_token(t):
+    n = _norm_token(t)
+    return n in SLUG_STRIP_TOKENS or bool(_NOMINAL_VALUE_RE.match(n))
+
+
+def _is_share_class_token(t):
+    n = _norm_token(t)
+    return n in SHARE_CLASS_TOKENS or bool(_NOMINAL_VALUE_RE.match(n))
+
+
+def _strip_trailing(tokens, stripped_any=False):
+    """Pop trailing share-class, then legal-form tokens. Never strips to empty."""
+    tokens = list(tokens)
+    seen_legal = False
     while len(tokens) > 1:
-        last = _norm(tokens[-1])
-        if _strippable(tokens[-1]) or not last:
+        last = _norm_token(tokens[-1])
+        if not last:
+            tokens.pop()   # bare '&' in 'AG & Co KGaA'
+        elif last in LEGAL_FORM_TOKENS:
+            tokens.pop()
+            stripped_any = seen_legal = True
+        elif seen_legal:
+            break
+        elif _is_share_class_token(tokens[-1]):
             tokens.pop()
             stripped_any = True
-        elif len(last) == 1 and last.isalpha() and (stripped_any or _strippable(tokens[-2])):
+        elif len(last) == 1 and last.isalpha() and (stripped_any or _is_strip_token(tokens[-2])):
             tokens.pop()   # class letter: 'Nolato AB B Ord Shs', 'Brookfield Corp Cls A'
             stripped_any = True
+        elif stripped_any and re.fullmatch(r"(19|20)\d\d", last):
+            tokens.pop()   # share-class year: 'Fair Oaks Income Limited 2021 Shs NPV'
         else:
             break
-    return " ".join(tokens)
+    return tokens
+
+
+def _drop_repeated_short_name(tokens):
+    """'Siemens AG Siemens' -> 'Siemens'; 'X REIT P X' -> 'X REIT'.
+
+    Investegate often lists '<legal name> <legal form> <short name>'. Drop the
+    trailing repeat only when the word before it is a legal form or a truncated
+    single letter, so genuine repeats like 'Mahindra & Mahindra' survive.
+    """
+    norm = [_norm_token(t) for t in tokens]
+    for k in range(len(tokens) // 2, 0, -1):
+        head, tail = norm[:-k], norm[-k:]
+        if len(head) <= k or head[:k] != tail:
+            continue
+        before = tokens[len(head) - 1]
+        nb = _norm_token(before)
+        if _is_strip_token(before) or (len(nb) == 1 and nb.isalpha()):
+            return _strip_trailing(tokens[:len(head)], stripped_any=True)
+    return tokens
 
 
 def make_slug(company_name, ticker):
