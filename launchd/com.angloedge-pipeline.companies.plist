@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.angloedge-pipeline.companies</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 export_companies.py</string>
+    </array>
+
+    <!-- Daily at 17:30 UK time, after the 17:00 EOD briefing. Runs every day (no weekend skip). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>17</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/companies.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/companies.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

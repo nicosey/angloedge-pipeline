@@ -542,3 +542,35 @@ def update_rns_enrichment(rns_number, impact_score, insight, key_themes):
         con.commit()
         con.close()
     _db_op(_)
+
+
+def get_rns_for_export():
+    """Return every RNS row with the fields the company-page exporter may publish.
+
+    Deliberately selects only our own stored fields (no announcement body is
+    stored or exported). rns_number is included as a stable tie-breaker only.
+    """
+    def _():
+        con = _connect()
+        rows = con.execute(
+            "SELECT rns_number, timestamp, company_name, ticker, headline, url, "
+            "       category, impact_score, insight, key_themes "
+            "FROM rns_announcements"
+        ).fetchall()
+        con.close()
+        return [
+            {
+                "rns_number":   r[0],
+                "timestamp":    r[1],
+                "company_name": r[2],
+                "ticker":       r[3],
+                "headline":     r[4],
+                "url":          r[5],
+                "category":     r[6],
+                "impact_score": r[7],
+                "insight":      r[8],
+                "key_themes":   r[9],
+            }
+            for r in rows
+        ]
+    return _db_op(_)

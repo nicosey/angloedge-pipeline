@@ -517,6 +517,250 @@ class TestArticlesFromLive(unittest.TestCase):
             self.assertEqual(articles, [])
 
 
+# ── company export tests ──────────────────────────────────────
+
+def _rns_row(rns, ticker, ts, name="Acme Plc", category="Results", score=None,
+             insight=None, themes=None, headline="Final Results"):
+    return {
+        "rns_number": str(rns), "timestamp": ts, "company_name": name, "ticker": ticker,
+        "headline": headline, "url": f"https://example.com/{rns}", "category": category,
+        "impact_score": score, "insight": insight, "key_themes": themes,
+    }
+
+
+class TestCompanyExportHelpers(unittest.TestCase):
+
+    def test_slug_is_name_plus_ticker(self):
+        from export_companies import make_slug
+        self.assertEqual(make_slug("Ceres Power Holdings", "CWR"), "ceres-power-holdings-cwr")
+
+    def test_slug_handles_dotted_ticker_and_punctuation(self):
+        from export_companies import make_slug
+        self.assertEqual(make_slug("BT Group PLC (The)", "BT.A"), "bt-group-plc-the-bt-a")
+
+    def test_slug_strips_accents(self):
+        from export_companies import slugify
+        self.assertEqual(slugify("Société Générale"), "societe-generale")
+
+    def test_slug_falls_back_to_ticker_when_name_empty(self):
+        from export_companies import make_slug
+        self.assertEqual(make_slug("", "0HAF"), "0haf")
+
+    def test_key_themes_json_array(self):
+        from export_companies import parse_key_themes
+        self.assertEqual(parse_key_themes('["buyback", "capital return"]'), ["buyback", "capital return"])
+
+    def test_key_themes_null_and_empty(self):
+        from export_companies import parse_key_themes
+        self.assertEqual(parse_key_themes(None), [])
+        self.assertEqual(parse_key_themes(""), [])
+
+    def test_key_themes_non_json_string_wrapped(self):
+        from export_companies import parse_key_themes
+        self.assertEqual(parse_key_themes("mining"), ["mining"])
+        self.assertEqual(parse_key_themes('"mining"'), ["mining"])
+
+    def test_invalid_timestamp_returns_none(self):
+        from export_companies import parse_timestamp
+        self.assertIsNone(parse_timestamp("25 May 2026 05:45 XM"))
+        self.assertIsNone(parse_timestamp(None))
+        self.assertIsNotNone(parse_timestamp("2026-05-25T17:45:00"))
+
+    def test_unenriched_row_has_explicit_nulls(self):
+        from export_companies import format_announcement
+        a = format_announcement(_rns_row(1, "ACM", "2026-05-01T09:00:00", category=""))
+        self.assertFalse(a["enriched"])
+        for key in ("impact_score", "insight", "key_themes", "category"):
+            self.assertIn(key, a)
+            self.assertIsNone(a[key])
+
+    def test_low_score_is_distinguishable_from_unenriched(self):
+        from export_companies import format_announcement
+        a = format_announcement(_rns_row(1, "ACM", "2026-05-01T09:00:00", score=1,
+                                         insight="Routine.", themes=None))
+        self.assertTrue(a["enriched"])
+        self.assertEqual(a["impact_score"], 1)
+        self.assertEqual(a["key_themes"], [])
+
+    def test_exported_fields_exclude_anything_else(self):
+        from export_companies import format_announcement
+        row = _rns_row(1, "ACM", "2026-05-01T09:00:00")
+        row["body"] = "SHOULD NEVER APPEAR"
+        a = format_announcement(row)
+        self.assertEqual(set(a), {"timestamp", "category", "headline", "url", "enriched",
+                                  "impact_score", "insight", "key_themes"})
+
+
+class TestExportCompanies(unittest.TestCase):
+
+    COMPANIES = os.path.join("src", "data", "companies")
+
+    def setUp(self):
+        self.tmp  = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        self.git  = MagicMock()
+        self.dir  = os.path.join(self.repo, self.COMPANIES)
+        self.map  = os.path.join(self.repo, "src", "data", "company-slugs.json")
+        self.idx  = os.path.join(self.repo, "src", "data", "companies-index.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _rows(self, name="Acme Plc"):
+        return [
+            _rns_row(1, "ACM", "2026-05-01T09:00:00", name=name),
+            _rns_row(2, "ACM", "2026-05-03T09:00:00", name=name, score=7,
+                     insight="Beat.", themes='["growth"]'),
+            _rns_row(3, "ACM", "2026-05-02T09:00:00", name=name),
+            _rns_row(4, "SML", "2026-05-04T09:00:00", name="Small Co"),
+            _rns_row(5, "",    "2026-05-04T09:00:00", name="No Ticker Ltd"),
+        ]
+
+    def _run(self, rows, **kwargs):
+        from export_companies import export_companies
+        with patch("export_companies.log"):
+            return export_companies(rows, self.repo, self.COMPANIES, git=self.git, **kwargs)
+
+    def _load(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def test_exports_only_companies_at_or_above_minimum(self):
+        s = self._run(self._rows())
+        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+        self.assertEqual(s["exported"], 1)
+        self.assertEqual(s["below_min"], 1)
+        self.assertEqual(s["no_ticker_rows"], 1)
+
+    def test_minimum_is_configurable(self):
+        s = self._run(self._rows(), min_announcements=1)
+        self.assertEqual(s["exported"], 2)
+
+    def test_company_file_contents(self):
+        self._run(self._rows())
+        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        self.assertEqual(c["name"], "Acme Plc")
+        self.assertEqual(c["ticker"], "ACM")
+        self.assertEqual(c["slug"], "acme-plc-acm")
+        self.assertEqual(c["announcement_count"], 3)
+        self.assertEqual(c["latest_announcement"], "2026-05-03T09:00:00")
+        self.assertEqual([a["timestamp"][:10] for a in c["announcements"]],
+                         ["2026-05-03", "2026-05-02", "2026-05-01"])
+        self.assertEqual(c["announcements"][0]["key_themes"], ["growth"])
+        self.assertIsNone(c["announcements"][1]["impact_score"])
+
+    def test_invalid_timestamp_sorted_last_and_excluded_from_latest(self):
+        rows = self._rows() + [_rns_row(9, "ACM", "garbage 99 XM")]
+        s = self._run(rows)
+        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        self.assertEqual(c["latest_announcement"], "2026-05-03T09:00:00")
+        self.assertEqual(c["announcements"][-1]["timestamp"], "garbage 99 XM")
+        self.assertEqual(s["invalid_timestamps"], 1)
+
+    def test_writes_index(self):
+        self._run(self._rows())
+        index = self._load(self.idx)
+        self.assertEqual(index, [{"name": "Acme Plc", "ticker": "ACM", "slug": "acme-plc-acm",
+                                  "announcement_count": 3,
+                                  "latest_announcement": "2026-05-03T09:00:00"}])
+
+    def test_commits_and_pushes_only_export_paths(self):
+        self._run(self._rows())
+        subcommands = [c.args[1] for c in self.git.call_args_list]
+        self.assertEqual(subcommands, ["add", "commit", "pull", "push"])
+        commit_args = self.git.call_args_list[1].args
+        self.assertIn(self.COMPANIES, commit_args)
+        self.assertIn("--", commit_args)
+
+    def test_second_identical_run_changes_nothing(self):
+        self._run(self._rows())
+        self.git.reset_mock()
+        s = self._run(self._rows())
+        self.assertEqual(s["new"] + s["changed"], 0)
+        self.assertEqual(s["unchanged"], 1)
+        self.git.assert_not_called()
+
+    def test_slug_is_sticky_across_rename(self):
+        self._run(self._rows())
+        s = self._run(self._rows(name="Acme Holdings Group"))
+        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        self.assertEqual(c["name"], "Acme Holdings Group")
+        self.assertEqual(s["pruned"], 0)
+
+    def test_slug_recovered_from_files_if_map_lost(self):
+        self._run(self._rows())
+        os.remove(self.map)
+        self._run(self._rows(name="Acme Holdings Group"))
+        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+        self.assertEqual(self._load(self.map), {"ACM": "acme-plc-acm"})
+
+    def test_corrupt_slug_map_aborts(self):
+        os.makedirs(os.path.dirname(self.map))
+        with open(self.map, "w") as f:
+            f.write("{not json")
+        with self.assertRaises(RuntimeError):
+            self._run(self._rows())
+
+    def test_new_slug_collision_gets_suffix(self):
+        os.makedirs(os.path.dirname(self.map))
+        with open(self.map, "w") as f:
+            json.dump({"OLD": "acme-plc-acm"}, f)
+        self._run(self._rows())
+        self.assertIn("acme-plc-acm-2.json", os.listdir(self.dir))
+
+    def test_prunes_stale_files(self):
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "gone-co-gne.json"), "w") as f:
+            json.dump({"ticker": "GNE", "slug": "gone-co-gne"}, f)
+        s = self._run(self._rows())
+        self.assertEqual(s["pruned"], 1)
+        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+
+    def test_dry_run_writes_nothing(self):
+        s = self._run(self._rows(), dry_run=True)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "src")))
+        self.assertEqual(s["new"], 1)
+        self.git.assert_not_called()
+
+    def test_limit_skips_index_prune_and_git(self):
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "gone-co-gne.json"), "w") as f:
+            json.dump({"ticker": "GNE", "slug": "gone-co-gne"}, f)
+        s = self._run(self._rows(), limit=1, min_announcements=1)
+        self.assertEqual(s["exported"], 1)
+        self.assertEqual(s["pruned"], 0)
+        self.assertFalse(os.path.exists(self.idx))
+        self.assertIn("gone-co-gne.json", os.listdir(self.dir))
+        self.git.assert_not_called()
+
+    def test_git_failure_raises(self):
+        self.git.side_effect = RuntimeError("auth failed")
+        with self.assertRaises(RuntimeError):
+            self._run(self._rows())
+
+
+class TestGetRnsForExport(unittest.TestCase):
+
+    def test_returns_stored_fields_including_unenriched(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "test.db")), patch("db.log"):
+                db.init_db()
+                db.save_rns_announcements([
+                    {"rns_number": "1", "timestamp": "2026-05-01T09:00:00", "company_name": "Acme",
+                     "ticker": "ACM", "headline": "Results", "url": "u1", "category": "Results"},
+                    {"rns_number": "2", "timestamp": "2026-05-02T09:00:00", "company_name": "Acme",
+                     "ticker": "ACM", "headline": "AGM", "url": "u2", "category": "AGM/EGM"},
+                ])
+                db.update_rns_enrichment("1", 6, "Solid.", ["growth"])
+                rows = {r["rns_number"]: r for r in db.get_rns_for_export()}
+        self.assertEqual(rows["1"]["impact_score"], 6)
+        self.assertEqual(json.loads(rows["1"]["key_themes"]), ["growth"])
+        self.assertIsNone(rows["2"]["impact_score"])
+        self.assertIsNone(rows["2"]["key_themes"])
+
+
 # ── github connection test ────────────────────────────────────
 
 class TestGitHubConnection(unittest.TestCase):
