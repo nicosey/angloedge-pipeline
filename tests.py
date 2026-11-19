@@ -536,7 +536,7 @@ class TestCompanyExportHelpers(unittest.TestCase):
 
     def test_slug_handles_dotted_ticker_and_punctuation(self):
         from export_companies import make_slug
-        self.assertEqual(make_slug("BT Group PLC (The)", "BT.A"), "bt-group-plc-the-bt-a")
+        self.assertEqual(make_slug("BT Group PLC (The)", "BT.A"), "bt-group-bt-a")
 
     def test_slug_strips_accents(self):
         from export_companies import slugify
@@ -545,6 +545,42 @@ class TestCompanyExportHelpers(unittest.TestCase):
     def test_slug_falls_back_to_ticker_when_name_empty(self):
         from export_companies import make_slug
         self.assertEqual(make_slug("", "0HAF"), "0haf")
+
+    def test_slug_strips_share_class_and_legal_form(self):
+        from export_companies import make_slug
+        self.assertEqual(make_slug("Amedeo Air Four Plus Limited Red Ord NPV", "AA4"),
+                         "amedeo-air-four-plus-aa4")
+
+    def test_slug_name_variants(self):
+        from export_companies import slug_name
+        cases = {
+            "Nolato AB B Ord Shs":           "Nolato",
+            "Brookfield Corporation Clas":   "Brookfield",
+            "Brookfield Corporation Cls A":  "Brookfield",
+            "Taseko Mines Limited NPV (DI)": "Taseko Mines",
+            "Hemnet Group AB (PUBL)":        "Hemnet Group",
+            "Sdiptech Ab (Publ)":            "Sdiptech",
+            "Acme PLC Ord 0.1p":             "Acme",
+            "Acme Plc ORD GBP0.01":          "Acme",
+            "Ceres Power Holdings":          "Ceres Power Holdings",
+            "Plus 500":                      "Plus 500",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(slug_name(raw), expected, raw)
+
+    def test_slug_name_never_strips_to_empty(self):
+        from export_companies import slug_name
+        self.assertEqual(slug_name("Ord Shs"), "Ord")
+        self.assertEqual(slug_name("(DI)"), "(DI)")
+
+    def test_debt_programme_issuer_detection(self):
+        from export_companies import is_debt_programme_issuer
+        debt = [_rns_row(1, "BAH", "2026-05-01T09:00:00", headline="Publication of Final Terms"),
+                _rns_row(2, "BAH", "2026-05-02T09:00:00", headline="Final Terms - XS1234567890")]
+        self.assertTrue(is_debt_programme_issuer(debt))
+        mixed = debt + [_rns_row(3, "BAH", "2026-05-03T09:00:00", headline="Annual Report")]
+        self.assertFalse(is_debt_programme_issuer(mixed))
+        self.assertFalse(is_debt_programme_issuer([]))
 
     def test_key_themes_json_array(self):
         from export_companies import parse_key_themes
@@ -653,7 +689,7 @@ class TestExportCompanies(unittest.TestCase):
 
     def test_exports_only_companies_at_or_above_minimum(self):
         s = self._run(self._rows())
-        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+        self.assertEqual(os.listdir(self.dir), ["acme-acm.json"])
         self.assertEqual(s["exported"], 1)
         self.assertEqual(s["below_min"], 1)
         self.assertEqual(s["no_ticker_rows"], 1)
@@ -664,10 +700,10 @@ class TestExportCompanies(unittest.TestCase):
 
     def test_company_file_contents(self):
         self._run(self._rows())
-        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        c = self._load(os.path.join(self.dir, "acme-acm.json"))
         self.assertEqual(c["name"], "Acme Plc")
         self.assertEqual(c["ticker"], "ACM")
-        self.assertEqual(c["slug"], "acme-plc-acm")
+        self.assertEqual(c["slug"], "acme-acm")
         self.assertEqual(c["announcement_count"], 3)
         self.assertEqual(c["latest_announcement"], "2026-05-03T09:00:00")
         self.assertEqual([a["timestamp"][:10] for a in c["announcements"]],
@@ -678,7 +714,7 @@ class TestExportCompanies(unittest.TestCase):
     def test_invalid_timestamp_sorted_last_and_excluded_from_latest(self):
         rows = self._rows() + [_rns_row(9, "ACM", "garbage 99 XM")]
         s = self._run(rows)
-        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        c = self._load(os.path.join(self.dir, "acme-acm.json"))
         self.assertEqual(c["latest_announcement"], "2026-05-03T09:00:00")
         self.assertEqual(c["announcements"][-1]["timestamp"], "garbage 99 XM")
         self.assertEqual(s["invalid_timestamps"], 1)
@@ -706,10 +742,34 @@ class TestExportCompanies(unittest.TestCase):
         self.assertEqual([c["ticker"] for c in index], ["NAT", "ISO"])
         self.assertEqual(index[0]["latest_announcement"], "2026-10-03T09:00:00")
 
+    def test_skips_debt_programme_issuers(self):
+        rows = self._rows() + [
+            _rns_row(20 + i, "ANG", f"2026-05-1{i}T09:00:00", name="Republic of Angola",
+                     headline="Publication of Final Terms") for i in range(3)]
+        s = self._run(rows)
+        self.assertEqual(os.listdir(self.dir), ["acme-acm.json"])
+        self.assertEqual(s["debt_programme"], 1)
+        self.assertEqual(s["below_min"], 1)
+        self.assertNotIn("ANG", self._load(self.map))
+
+    def test_share_class_stripped_from_slug_but_not_display_name(self):
+        rows = [_rns_row(i, "AA4", f"2026-05-0{i}T09:00:00",
+                         name="Amedeo Air Four Plus Limited Red Ord NPV") for i in range(1, 4)]
+        self._run(rows)
+        c = self._load(os.path.join(self.dir, "amedeo-air-four-plus-aa4.json"))
+        self.assertEqual(c["name"], "Amedeo Air Four Plus Limited Red Ord NPV")
+
+    def test_existing_slug_kept_when_strip_rules_change(self):
+        os.makedirs(os.path.dirname(self.map))
+        with open(self.map, "w") as f:
+            json.dump({"ACM": "acme-plc-acm"}, f)
+        self._run(self._rows())
+        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+
     def test_writes_index(self):
         self._run(self._rows())
         index = self._load(self.idx)
-        self.assertEqual(index, [{"name": "Acme Plc", "ticker": "ACM", "slug": "acme-plc-acm",
+        self.assertEqual(index, [{"name": "Acme Plc", "ticker": "ACM", "slug": "acme-acm",
                                   "announcement_count": 3,
                                   "latest_announcement": "2026-05-03T09:00:00"}])
 
@@ -732,8 +792,8 @@ class TestExportCompanies(unittest.TestCase):
     def test_slug_is_sticky_across_rename(self):
         self._run(self._rows())
         s = self._run(self._rows(name="Acme Holdings Group"))
-        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
-        c = self._load(os.path.join(self.dir, "acme-plc-acm.json"))
+        self.assertEqual(os.listdir(self.dir), ["acme-acm.json"])
+        c = self._load(os.path.join(self.dir, "acme-acm.json"))
         self.assertEqual(c["name"], "Acme Holdings Group")
         self.assertEqual(s["pruned"], 0)
 
@@ -741,8 +801,8 @@ class TestExportCompanies(unittest.TestCase):
         self._run(self._rows())
         os.remove(self.map)
         self._run(self._rows(name="Acme Holdings Group"))
-        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
-        self.assertEqual(self._load(self.map), {"ACM": "acme-plc-acm"})
+        self.assertEqual(os.listdir(self.dir), ["acme-acm.json"])
+        self.assertEqual(self._load(self.map), {"ACM": "acme-acm"})
 
     def test_corrupt_slug_map_aborts(self):
         os.makedirs(os.path.dirname(self.map))
@@ -754,9 +814,9 @@ class TestExportCompanies(unittest.TestCase):
     def test_new_slug_collision_gets_suffix(self):
         os.makedirs(os.path.dirname(self.map))
         with open(self.map, "w") as f:
-            json.dump({"OLD": "acme-plc-acm"}, f)
+            json.dump({"OLD": "acme-acm"}, f)
         self._run(self._rows())
-        self.assertIn("acme-plc-acm-2.json", os.listdir(self.dir))
+        self.assertIn("acme-acm-2.json", os.listdir(self.dir))
 
     def test_prunes_stale_files(self):
         os.makedirs(self.dir)
@@ -764,7 +824,7 @@ class TestExportCompanies(unittest.TestCase):
             json.dump({"ticker": "GNE", "slug": "gone-co-gne"}, f)
         s = self._run(self._rows())
         self.assertEqual(s["pruned"], 1)
-        self.assertEqual(os.listdir(self.dir), ["acme-plc-acm.json"])
+        self.assertEqual(os.listdir(self.dir), ["acme-acm.json"])
 
     def test_dry_run_writes_nothing(self):
         s = self._run(self._rows(), dry_run=True)

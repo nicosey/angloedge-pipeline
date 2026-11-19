@@ -36,6 +36,34 @@ INDEX_FILENAME      = "companies-index.json"
 SLUG_MAP_FILENAME   = "company-slugs.json"
 MAX_TIMESTAMP_WARNINGS = 20   # cap per-row log lines; the summary has the full count
 
+# Trailing tokens removed from company names before slugifying (lowercase,
+# punctuation-stripped). Affects NEW slugs only — existing slugs are sticky.
+SLUG_STRIP_TOKENS = {
+    # share-class / listing notation
+    "ord", "ords", "ordinary", "shs", "sh", "shares", "share", "npv", "red", "redeemable",
+    "cls", "class", "clas", "pref", "preference", "prf", "pfd", "cnv", "conv", "di",
+    "dr", "adr", "gdr", "sdr", "reg", "registered", "units", "unit", "wi", "nv", "vtg",
+    # legal forms
+    "plc", "limited", "ltd", "inc", "incorporated", "corp", "corporation", "llc", "lp",
+    "ag", "sa", "nv", "ab", "publ", "asa", "oyj", "spa", "se", "icav", "bv",
+}
+# Nominal values such as '0.1p', '10p', 'gbp0.01', 'usd1', '€0.05'
+_NOMINAL_VALUE_RE = re.compile(r"^(?:(?:gbp|usd|eur|sek|nok|dkk|chf|£|\$|€)\d[\d.]*p?|\d+(?:\.\d+)?p)$")
+
+# Issuers whose announcements ALL match one of these headline patterns are
+# debt-programme issuers (sovereigns, bond SPVs) and get no company page.
+DEBT_PROGRAMME_HEADLINE_PATTERNS = (
+    r"^\s*(?:publication\s+of\s+)?final\s+terms\b",
+)
+_DEBT_PROGRAMME_RES = [re.compile(p, re.I) for p in DEBT_PROGRAMME_HEADLINE_PATTERNS]
+
+
+def is_debt_programme_issuer(rows):
+    """True when every announcement headline is a debt-programme filing."""
+    return bool(rows) and all(
+        any(rx.search(r["headline"] or "") for rx in _DEBT_PROGRAMME_RES) for r in rows
+    )
+
 
 # ── pure helpers ─────────────────────────────────────────────
 
@@ -45,8 +73,45 @@ def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+def slug_name(company_name):
+    """Company name with trailing share-class and legal-form tokens removed.
+
+    Used only for the slug; the display name is never altered. Strips trailing
+    parenthesised groups ('(DI)', '(Publ)'), then trailing tokens from
+    SLUG_STRIP_TOKENS / nominal values ('0.1p', 'GBP0.01'), and a class letter
+    ('A', 'B') when it sits next to share-class notation. Never strips to empty.
+    """
+    name = (company_name or "").strip()
+    while True:
+        stripped = re.sub(r"\s*\([^()]*\)\s*$", "", name)
+        if stripped == name or not stripped:
+            break
+        name = stripped
+    tokens = name.split()
+
+    def _norm(t):
+        return t.lower().strip(".,;:&-")
+
+    def _strippable(t):
+        n = _norm(t)
+        return n in SLUG_STRIP_TOKENS or bool(_NOMINAL_VALUE_RE.match(n))
+
+    stripped_any = False
+    while len(tokens) > 1:
+        last = _norm(tokens[-1])
+        if _strippable(tokens[-1]) or not last:
+            tokens.pop()
+            stripped_any = True
+        elif len(last) == 1 and last.isalpha() and (stripped_any or _strippable(tokens[-2])):
+            tokens.pop()   # class letter: 'Nolato AB B Ord Shs', 'Brookfield Corp Cls A'
+            stripped_any = True
+        else:
+            break
+    return " ".join(tokens)
+
+
 def make_slug(company_name, ticker):
-    name_part   = slugify(company_name)
+    name_part   = slugify(slug_name(company_name))
     ticker_part = slugify(ticker)
     return f"{name_part}-{ticker_part}" if name_part else ticker_part
 
@@ -314,7 +379,8 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     slug_map     = load_slug_map(map_path, companies_dir)
 
     # Build provisional companies (slug filled in below) and order by recency
-    companies = [build_company(t, rs, None) for t, rs in eligible.items()]
+    debt_issuers = {t for t, rs in eligible.items() if is_debt_programme_issuer(rs)}
+    companies = [build_company(t, rs, None) for t, rs in eligible.items() if t not in debt_issuers]
     companies.sort(key=lambda c: c["ticker"])                       # deterministic base order
     companies.sort(key=_latest_sort_key, reverse=True)
     if limit is not None:
@@ -346,6 +412,7 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
         "unchanged":         counts["unchanged"],
         "pruned":            0,
         "below_min":         below_min,
+        "debt_programme":    len(debt_issuers),
         "no_ticker_rows":    no_ticker,
         "invalid_timestamps": len(invalid_ts),
         "index_status":      "skipped",
@@ -411,6 +478,7 @@ def log_summary(s, dry_run):
     log(f"   Files unchanged:             {s['unchanged']}")
     log(f"   Files pruned:                {s['pruned']}")
     log(f"   Skipped (< {MIN_ANNOUNCEMENTS} announcements): {s['below_min']} companies")
+    log(f"   Skipped (debt programme):    {s['debt_programme']} issuers")
     log(f"   Skipped (no ticker):         {s['no_ticker_rows']} announcements")
     log(f"   Unparseable timestamps:      {s['invalid_timestamps']}")
 
