@@ -566,6 +566,32 @@ class TestCompanyExportHelpers(unittest.TestCase):
         self.assertIsNone(parse_timestamp(None))
         self.assertIsNotNone(parse_timestamp("2026-05-25T17:45:00"))
 
+    def test_parses_iso_timestamp(self):
+        from export_companies import parse_timestamp
+        from datetime import datetime
+        self.assertEqual(parse_timestamp("2026-05-22T22:00:00"), datetime(2026, 5, 22, 22, 0))
+
+    def test_parses_investegate_native_timestamp(self):
+        from export_companies import parse_timestamp
+        from datetime import datetime
+        self.assertEqual(parse_timestamp("21 Sep 2026 07:32 AM"), datetime(2026, 9, 21, 7, 32))
+        self.assertEqual(parse_timestamp("03 Nov 2026 04:15 PM"), datetime(2026, 11, 3, 16, 15))
+
+    def test_parses_timestamp_variants(self):
+        from export_companies import parse_timestamp
+        from datetime import datetime
+        expected = datetime(2026, 9, 21, 7, 32)
+        for raw in ("21 September 2026 07:32 AM", "21 Sept 2026 07:32 AM",
+                    "21 Sep 2026 07:32", "  21  Sep 2026 07:32 AM "):
+            self.assertEqual(parse_timestamp(raw), expected, raw)
+
+    def test_normalise_timestamp_to_iso(self):
+        from export_companies import normalise_timestamp
+        self.assertEqual(normalise_timestamp("21 Sep 2026 07:32 PM"), "2026-09-21T19:32:00")
+        self.assertEqual(normalise_timestamp("2026-05-22T22:00:00"), "2026-05-22T22:00:00")
+        self.assertEqual(normalise_timestamp("garbage"), "garbage")
+        self.assertIsNone(normalise_timestamp(None))
+
     def test_unenriched_row_has_explicit_nulls(self):
         from export_companies import format_announcement
         a = format_announcement(_rns_row(1, "ACM", "2026-05-01T09:00:00", category=""))
@@ -656,6 +682,29 @@ class TestExportCompanies(unittest.TestCase):
         self.assertEqual(c["latest_announcement"], "2026-05-03T09:00:00")
         self.assertEqual(c["announcements"][-1]["timestamp"], "garbage 99 XM")
         self.assertEqual(s["invalid_timestamps"], 1)
+
+    def test_mixed_timestamp_formats_sort_and_normalise(self):
+        rows = [
+            _rns_row(1, "MIX", "2026-05-22T22:00:00", name="Mixed Co"),
+            _rns_row(2, "MIX", "21 Sep 2026 07:32 AM", name="Mixed Co"),
+            _rns_row(3, "MIX", "03 Jun 2026 04:15 PM", name="Mixed Co"),
+            _rns_row(4, "MIX", "not a date", name="Mixed Co"),
+        ]
+        s = self._run(rows)
+        c = self._load(os.path.join(self.dir, "mixed-co-mix.json"))
+        self.assertEqual([a["timestamp"] for a in c["announcements"]],
+                         ["2026-09-21T07:32:00", "2026-06-03T16:15:00",
+                          "2026-05-22T22:00:00", "not a date"])
+        self.assertEqual(c["latest_announcement"], "2026-09-21T07:32:00")
+        self.assertEqual(s["invalid_timestamps"], 1)
+
+    def test_index_orders_across_timestamp_formats(self):
+        rows = [_rns_row(i, "ISO", f"2026-05-2{i}T09:00:00", name="Iso Co") for i in range(1, 4)]
+        rows += [_rns_row(10 + i, "NAT", f"0{i} Oct 2026 09:00 AM", name="Native Co") for i in range(1, 4)]
+        self._run(rows)
+        index = self._load(self.idx)
+        self.assertEqual([c["ticker"] for c in index], ["NAT", "ISO"])
+        self.assertEqual(index[0]["latest_announcement"], "2026-10-03T09:00:00")
 
     def test_writes_index(self):
         self._run(self._rows())

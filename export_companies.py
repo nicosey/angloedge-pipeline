@@ -34,6 +34,7 @@ MIN_ANNOUNCEMENTS   = 3
 DEFAULT_COMPANIES_DIR = os.path.join("src", "data", "companies")
 INDEX_FILENAME      = "companies-index.json"
 SLUG_MAP_FILENAME   = "company-slugs.json"
+MAX_TIMESTAMP_WARNINGS = 20   # cap per-row log lines; the summary has the full count
 
 
 # ── pure helpers ─────────────────────────────────────────────
@@ -50,15 +51,41 @@ def make_slug(company_name, ticker):
     return f"{name_part}-{ticker_part}" if name_part else ticker_part
 
 
+# Non-ISO formats seen in rns_announcements.timestamp, tried in order after ISO.
+# collect.py parses Investegate's '21 Sep 2026 07:32 AM' with %B (full month
+# name), which only matches months whose full and short names coincide (May);
+# every other month is stored raw. Full-name and 24h variants are accepted too.
+_TIMESTAMP_FORMATS = (
+    "%d %b %Y %I:%M %p",    # 21 Sep 2026 07:32 AM  (Investegate native)
+    "%d %B %Y %I:%M %p",    # 21 September 2026 07:32 AM
+    "%d %b %Y %H:%M",       # 21 Sep 2026 07:32
+    "%d %B %Y %H:%M",       # 21 September 2026 07:32
+)
+
+
 def parse_timestamp(raw):
-    """Return a naive datetime for a valid ISO-8601 timestamp, else None."""
+    """Return a naive datetime for any known timestamp format, else None."""
     if not raw or not isinstance(raw, str):
         return None
+    text = raw.strip()
     try:
-        dt = datetime.fromisoformat(raw.strip())
+        return datetime.fromisoformat(text).replace(tzinfo=None)
     except ValueError:
-        return None
-    return dt.replace(tzinfo=None)
+        pass
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\bSept\b", "Sep", text, flags=re.I)   # %b only accepts 'Sep'
+    for fmt in _TIMESTAMP_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalise_timestamp(raw):
+    """ISO-8601 (seconds precision) for parseable values; the raw value otherwise."""
+    dt = parse_timestamp(raw)
+    return dt.isoformat(timespec="seconds") if dt else raw
 
 
 def parse_key_themes(raw):
@@ -94,7 +121,7 @@ def format_announcement(row):
     """
     enriched = row["impact_score"] is not None
     return {
-        "timestamp":    row["timestamp"],
+        "timestamp":    normalise_timestamp(row["timestamp"]),
         "category":     row["category"] or None,
         "headline":     row["headline"],
         "url":          row["url"] or None,
@@ -133,7 +160,7 @@ def sort_company_rows(rows):
 def build_company(ticker, rows, slug):
     """Build the exported dict for one company. rows must already be sorted."""
     valid_rows = [r for r in rows if parse_timestamp(r["timestamp"]) is not None]
-    latest     = valid_rows[0]["timestamp"] if valid_rows else None
+    latest     = normalise_timestamp(valid_rows[0]["timestamp"]) if valid_rows else None
     # Display name: from the most recent row with a valid timestamp, else any row
     name_row   = valid_rows[0] if valid_rows else rows[0]
     return {
@@ -276,8 +303,10 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     tag           = " [DRY RUN]" if dry_run else ""
 
     groups, no_ticker, invalid_ts = group_rows(rows)
-    for r in invalid_ts:
+    for r in invalid_ts[:MAX_TIMESTAMP_WARNINGS]:
         log(f"  ⚠ Unparseable timestamp {r['timestamp']!r} — {r['ticker']} rns {r['rns_number']} (sorted last)")
+    if len(invalid_ts) > MAX_TIMESTAMP_WARNINGS:
+        log(f"  ⚠ ...and {len(invalid_ts) - MAX_TIMESTAMP_WARNINGS} more unparseable timestamp(s)")
 
     eligible  = {t: sort_company_rows(rs) for t, rs in groups.items() if len(rs) >= min_n}
     below_min = len(groups) - len(eligible)
