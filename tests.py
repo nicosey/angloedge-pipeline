@@ -1052,6 +1052,188 @@ class TestBackfillCategories(unittest.TestCase):
         self.assertEqual(sorted(pending), ["2", "3"])  # both re-enriched; only 3 will be posted
 
 
+# ── headline recovery ─────────────────────────────────────────
+
+def _page(main_title, doc_h1=None, body="<p>Body text that must never be read.</p>"):
+    doc = f'<div class="fr-view-element displayHScroll"><div><h1><span class="js">{doc_h1}</span></h1>{body}</div></div>' if doc_h1 else ""
+    return (f'<html><head><title>{main_title} | Company Announcement | Investegate</title></head><body>'
+            f'<div class="art-board py-3"><h1 id="main-title">{main_title}</h1></div>{doc}</body></html>')
+
+
+class TestHeadlineExtraction(unittest.TestCase):
+
+    def _x(self, page, stored):
+        from recover_headlines import extract_full_headline
+        return extract_full_headline(page, stored)
+
+    def test_main_title_full(self):
+        page = _page("Coinsilium Group Limited: Appointment of Chief Operating Officer and Executive Director")
+        self.assertEqual(self._x(page, "Coinsilium Group Limited: Appointment of Chie..."),
+                         ("Coinsilium Group Limited: Appointment of Chief Operating Officer and Executive Director", None))
+
+    def test_rns_falls_back_to_document_h1(self):
+        page = _page("Swedbank\u2019s interim report for the third quarter...",
+                     doc_h1="Swedbank's interim report for the third quarter 2026")
+        self.assertEqual(self._x(page, "Swedbank\u2019s interim report for the third quarter..."),
+                         ("Swedbank's interim report for the third quarter 2026", None))
+
+    def test_entities_and_whitespace(self):
+        page = _page("Fuller, Smith &amp; Turner PLC:  Trading\n  Update for the 52 weeks")
+        self.assertEqual(self._x(page, "Fuller, Smith & Turner PLC:  Trading Update fo...")[0],
+                         "Fuller, Smith & Turner PLC: Trading Update for the 52 weeks")
+
+    def test_mismatch_is_rejected(self):
+        self.assertEqual(self._x(_page("Something else entirely and much longer"), "Appointment of Chair and Non-Exec..."),
+                         (None, "mismatch"))
+
+    def test_still_truncated_is_rejected(self):
+        page = _page("Swedbank interim report for the...", doc_h1=None)
+        self.assertEqual(self._x(page, "Swedbank interim report for the..."), (None, "still_truncated"))
+
+    def test_no_title_is_unparseable(self):
+        self.assertEqual(self._x("<html><body><p>nothing</p></body></html>", "Abc..."), (None, "unparseable"))
+
+    def test_only_headings_are_read(self):
+        from recover_headlines import candidate_titles
+        page = _page("Short...", doc_h1="Short title in full", body="<p>Short title in full plus secret body</p>")
+        self.assertEqual(candidate_titles(page), ["Short...", "Short title in full"])
+
+
+class TestFetcher(unittest.TestCase):
+
+    def _fetcher(self, get):
+        from recover_headlines import Fetcher
+        self.sleeps = []
+        self.t = [0.0]
+        def sleep(s): self.sleeps.append(s); self.t[0] += s
+        return Fetcher(get=get, interval=2.0, retry_wait=30, sleep=sleep, clock=lambda: self.t[0])
+
+    def test_rate_limit(self):
+        f = self._fetcher(lambda url: "ok")
+        f.fetch("a"); f.fetch("b"); f.fetch("c")
+        self.assertEqual(self.sleeps, [2.0, 2.0])
+
+    def test_retries_once_on_5xx(self):
+        from recover_headlines import FetchError
+        calls = []
+        def get(url):
+            calls.append(url)
+            if len(calls) == 1:
+                raise FetchError("http_503")
+            return "ok"
+        self.assertEqual(self._fetcher(get).fetch("a"), "ok")
+        self.assertEqual(len(calls), 2)
+        self.assertIn(30, self.sleeps)
+
+    def test_404_not_retried(self):
+        from recover_headlines import FetchError
+        calls = []
+        def get(url):
+            calls.append(url); raise FetchError("not_found")
+        with self.assertRaises(FetchError):
+            self._fetcher(get).fetch("a")
+        self.assertEqual(len(calls), 1)
+
+
+class TestRecoverHeadlines(unittest.TestCase):
+
+    URL = "https://www.investegate.co.uk/announcement/eqs/x/y/"
+
+    def _db(self, tmpdir, rows):
+        import db
+        db.init_db()
+        db.save_rns_announcements([
+            {"rns_number": n, "timestamp": f"2026-06-0{i + 1}T09:00:00", "company_name": "Acme", "ticker": "ACM",
+             "headline": h, "url": self.URL + n, "category": c} for i, (n, h, c) in enumerate(rows)])
+        db.update_rns_enrichment("1", 7, "Insight.", ["growth"])
+
+    def _run(self, pages, dry_run=False, now=None, force=True):
+        import db
+        from recover_headlines import Fetcher, FetchError, recover, load_truncated_rows
+        def get(url):
+            page = pages[url.rsplit("/", 1)[-1]]
+            if isinstance(page, Exception):
+                raise page
+            return page
+        con = db._connect()
+        rows = load_truncated_rows(con)
+        counts = recover(con, rows, Fetcher(get=get, interval=0, retry_wait=0, sleep=lambda s: None),
+                         dry_run=dry_run, now=now or (lambda: datetime(2026, 11, 22, 20, 0)), force=force)
+        got = {r[0]: r[1:] for r in con.execute(
+            "SELECT rns_number, headline, category, impact_score, insight, key_themes FROM rns_announcements")}
+        con.close()
+        return counts, got
+
+    ROWS = [("1", "Acme plc: Appointment of Chief Exec...", "Appointment"),
+            ("2", "Acme plc: Update on the acquisition of B...", "Acquisition"),
+            ("3", "Final Results", "Results"),
+            ("4", "Gone missing announcement headl...", "")]
+
+    def _pages(self):
+        from recover_headlines import FetchError
+        return {"1": _page("Acme plc: Appointment of Chief Executive Officer"),
+                "2": _page("Totally different page"),
+                "4": FetchError("not_found", "404")}
+
+    def test_updates_only_headline_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("recover_headlines.log"):
+                self._db(tmpdir, self.ROWS)
+                counts, got = self._run(self._pages())
+        self.assertEqual(counts["fixed"], 1)
+        self.assertEqual(counts["mismatch"], 1)
+        self.assertEqual(counts["not_found"], 1)
+        self.assertEqual(got["1"], ("Acme plc: Appointment of Chief Executive Officer", "Appointment", 7,
+                                    "Insight.", json.dumps(["growth"])))
+        self.assertEqual(got["2"][0], "Acme plc: Update on the acquisition of B...")   # left as is
+        self.assertEqual(got["3"][0], "Final Results")                                # never selected
+        self.assertEqual(got["4"][0], "Gone missing announcement headl...")
+
+    def test_rerun_skips_fixed_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("recover_headlines.log"):
+                self._db(tmpdir, self.ROWS)
+                self._run(self._pages())
+                pages = self._pages(); del pages["1"]          # a re-fetch of 1 would KeyError
+                counts, _ = self._run(pages)
+        self.assertEqual(counts["fixed"], 0)
+        self.assertEqual(sum(counts.values()), 2)
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("recover_headlines.log"):
+                self._db(tmpdir, self.ROWS)
+                counts, got = self._run(self._pages(), dry_run=True)
+        self.assertEqual(counts["fixed"], 1)
+        self.assertEqual(got["1"][0], "Acme plc: Appointment of Chief Exec...")
+
+    def test_stops_before_collector_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("recover_headlines.log"):
+                self._db(tmpdir, self.ROWS)
+                counts, got = self._run(self._pages(), now=lambda: datetime(2026, 11, 23, 6, 56), force=False)
+        self.assertEqual(counts["stopped_for_window"], 3)
+        self.assertEqual(got["1"][0], "Acme plc: Appointment of Chief Exec...")
+
+    def test_aborts_after_consecutive_failures(self):
+        from recover_headlines import FetchError, MAX_CONSECUTIVE_FAILURES
+        n = MAX_CONSECUTIVE_FAILURES + 3
+        rows = [(str(i), f"Headline number {i} that was cut...", "") for i in range(1, n + 1)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("recover_headlines.log"):
+                self._db(tmpdir, rows)
+                counts, _ = self._run({str(i): FetchError("http_403") for i in range(1, n + 1)})
+        self.assertEqual(counts["fetch_failed"], MAX_CONSECUTIVE_FAILURES)
+        self.assertEqual(counts["aborted_remaining"], 3)
+
+    def test_collector_window(self):
+        from recover_headlines import in_collector_window
+        self.assertTrue(in_collector_window(datetime(2026, 11, 23, 12, 0)))
+        self.assertTrue(in_collector_window(datetime(2026, 11, 23, 6, 55)))
+        self.assertFalse(in_collector_window(datetime(2026, 11, 23, 16, 40)))
+        self.assertFalse(in_collector_window(datetime(2026, 11, 23, 2, 0)))
+
+
 # ── github connection test ────────────────────────────────────
 
 class TestGitHubConnection(unittest.TestCase):
