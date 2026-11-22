@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import tempfile
+from datetime import datetime
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -907,6 +908,148 @@ class TestGetRnsForExport(unittest.TestCase):
         self.assertEqual(json.loads(rows["1"]["key_themes"]), ["growth"])
         self.assertIsNone(rows["2"]["impact_score"])
         self.assertIsNone(rows["2"]["key_themes"])
+
+
+# ── headline categorisation ───────────────────────────────────
+
+class TestDetectCategory(unittest.TestCase):
+
+    CASES = [
+        # Results, incl. report publications; meeting results are not Results
+        ("Final Results", "Results"),
+        ("Annual Financial Report", "Results"),
+        ("Half-year Financial Report", "Results"),
+        ("Half-Yearly Report", "Results"),
+        ("Interim Management Statement", "Results"),
+        ("Results of AGM", "AGM/EGM"),
+        ("Result of General Meeting", "AGM/EGM"),
+        ("Results of Court Meeting and General Meeting", "AGM/EGM"),
+        ("Annual Financial Report and Notice of AGM", "Results"),
+        # New listings — bare admission to trading is not one
+        ("Admission to AIM and First Day of Dealings", "New Listing"),
+        ("Publication of Prospectus and Intention to Float", "New Listing"),
+        ("Pricing of the IPO of METKA", "New Listing"),
+        ("Admission to Trading", None),
+        ("Admission of Further Securities to Trading", None),
+        # Acquisition — stems now match their full words
+        ("Acquisition of ClanTect Limited", "Acquisition"),
+        ("GSK plc to acquire BIOG portfolio company", "Acquisition"),
+        ("Statement re Possible Offer", "Acquisition"),
+        ("Extension of PUSU Deadline", "Acquisition"),
+        ("Irish Takeover Panel - Form 8 - DCC Energy plc", None),
+        # Director dealing — TR-1 is a major-holder notice, not a dealing
+        ("Director/PDMR Shareholding", "Director Dealing"),
+        ("Director Dealings", "Director Dealing"),
+        ("Notification of Managers’ and Closely Related", "Director Dealing"),
+        ("TR-1: Notification of Major Holdings", None),
+        ("Holding(s) in Company", None),
+        # Placing — fundraise stems, retail offers; issue of equity is not a placing
+        ("Intention to Fundraise", "Placing"),
+        ("Result of Retail Offer", "Placing"),
+        ("Issue of Equity", None),
+        # Appointment
+        ("Directorate change", "Appointment"),
+        ("Board Changes", "Appointment"),
+        ("Appointment of Non-Executive Director", "Appointment"),
+        ("Resignation of Chief Financial Officer", "Appointment"),
+        ("Director Declaration", None),
+        # Third-party research and routine filings stay uncategorised
+        ("Results analysis from Kepler Trust Intelligence", None),
+        ("Transaction in Own Shares", None),
+        ("Total Voting Rights", None),
+        ("", None),
+    ]
+
+    def test_cases(self):
+        from collect import _detect_category
+        for headline, expected in self.CASES:
+            with self.subTest(headline=headline):
+                self.assertEqual(_detect_category(headline), expected)
+
+    def test_new_categories_are_high_signal(self):
+        import db
+        self.assertIn("New Listing", db._HIGH_SIGNAL_CATEGORIES)
+        self.assertIn("Appointment", db._HIGH_SIGNAL_CATEGORIES)
+
+
+class TestBackfillCategories(unittest.TestCase):
+
+    NOW = datetime(2026, 11, 22, 18, 0)
+
+    def _row(self, n, headline, category, ts="2026-06-01T09:00:00", score=None, published=None):
+        return {"rns_number": str(n), "timestamp": ts, "headline": headline, "category": category,
+                "impact_score": score, "telegram_published_at": published}
+
+    def _plan(self, rows):
+        from backfill_categories import plan_changes
+        return {c["rns_number"]: c for c in plan_changes(rows, self.NOW)}
+
+    def test_unchanged_rows_are_skipped(self):
+        self.assertEqual(self._plan([self._row(1, "Final Results", "Results", score=6)]), {})
+
+    def test_leaving_enriched_category_clears_enrichment(self):
+        c = self._plan([self._row(1, "TR-1: Notification of Major Holdings", "Director Dealing", score=4,
+                                  published="2026-06-01T09:30:00")])["1"]
+        self.assertEqual((c["old"], c["new"], c["clear"], c["guard"]), ("Director Dealing", "", True, False))
+
+    def test_new_old_high_signal_row_is_guarded(self):
+        c = self._plan([self._row(1, "Annual Financial Report", "")])["1"]
+        self.assertEqual((c["new"], c["clear"], c["guard"]), ("Results", False, True))
+
+    def test_recent_row_is_not_guarded(self):
+        c = self._plan([self._row(1, "Annual Financial Report", "", ts="2026-11-22T09:00:00")])["1"]
+        self.assertFalse(c["guard"])
+        self.assertTrue(c["pending"])
+
+    def test_widened_set_guards_unchanged_appointment(self):
+        # Already "Appointment", unchanged — but newly enrichable, so must not be posted
+        c = self._plan([self._row(1, "Board Change", "Appointment")])["1"]
+        self.assertEqual((c["old"], c["new"], c["guard"]), ("Appointment", "Appointment", True))
+
+    def test_existing_backlog_is_not_guarded(self):
+        # Unenriched Results row was already due to publish — behaviour unchanged
+        self.assertEqual(self._plan([self._row(1, "Final Results", "Results")]), {})
+
+    def test_reenriched_move_within_high_signal_is_guarded_if_unpublished(self):
+        c = self._plan([self._row(1, "Trading Update and Completion of Acquisition", "Trading Update", score=5)])["1"]
+        self.assertEqual((c["new"], c["clear"], c["guard"]), ("Acquisition", True, True))
+
+    def test_already_published_row_is_not_reguarded(self):
+        c = self._plan([self._row(1, "Directorate change", "", published="2026-06-01T10:00:00")])["1"]
+        self.assertFalse(c["guard"])
+
+    def test_unparseable_timestamp_is_guarded(self):
+        c = self._plan([self._row(1, "Directorate change", "", ts="garbage")])["1"]
+        self.assertTrue(c["guard"])
+
+    def test_apply_against_db(self):
+        import db
+        from backfill_categories import plan_changes, apply_changes
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "test.db")), patch("db.log"):
+                db.init_db()
+                db.save_rns_announcements([
+                    {"rns_number": "1", "timestamp": "2026-06-01T09:00:00", "company_name": "DCC",
+                     "ticker": "DCC", "headline": "Irish Takeover Panel - Form 8 - DCC plc", "url": "u",
+                     "category": "Acquisition"},
+                    {"rns_number": "2", "timestamp": "2026-06-01T09:00:00", "company_name": "Acme",
+                     "ticker": "ACM", "headline": "Directorate change", "url": "u", "category": ""},
+                    {"rns_number": "3", "timestamp": "2026-11-22T09:00:00", "company_name": "Acme",
+                     "ticker": "ACM", "headline": "Annual Financial Report", "url": "u", "category": ""},
+                ])
+                db.update_rns_enrichment("1", 7, "Wrong premise.", ["m&a"])
+                con = db._connect()
+                from backfill_categories import load_rows
+                apply_changes(con, plan_changes(load_rows(con), self.NOW), "2026-11-22T18:00:00")
+                got = {r[0]: r[1:] for r in con.execute(
+                    "SELECT rns_number, category, impact_score, insight, key_themes, enriched_at, "
+                    "telegram_published_at FROM rns_announcements")}
+                con.close()
+                pending = [r["rns_number"] for r in db.get_unenriched_rns()]
+        self.assertEqual(got["1"], ("", None, None, None, None, None))
+        self.assertEqual(got["2"], ("Appointment", None, None, None, None, "2026-11-22T18:00:00"))
+        self.assertEqual(got["3"], ("Results", None, None, None, None, None))
+        self.assertEqual(sorted(pending), ["2", "3"])  # both re-enriched; only 3 will be posted
 
 
 # ── github connection test ────────────────────────────────────

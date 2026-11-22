@@ -33,22 +33,48 @@ INVESTEGATE_URL = "https://www.investegate.co.uk/"
 _REQUEST_DELAY = 1.5
 
 # Headline-to-category inference rules — first match wins.
-# Patterns are intentionally broad so partial headlines still classify correctly.
+# Headlines arrive truncated (~50 chars), so patterns key on opening wording.
+# Word stems spell out their endings: a stem followed by \b (e.g. "acqui[rs]\b")
+# can never match "acquisition".
+#
+# Headlines matching _CATEGORY_EXCLUDE stay uncategorised whatever else they
+# contain: third-party research, and Irish Takeover Panel Form 8 dealing
+# disclosures (routine, despite the word "takeover").
+_CATEGORY_EXCLUDE = re.compile(
+    r'irish\s+takeover\s+panel|kepler\s+trust\s+intelligence|\bquoteddata\b', re.I)
+
 _CATEGORY_RULES = [
-    ("Results",          re.compile(r'\b(results|earnings|revenue|profit|loss|turnover)\b', re.I)),
-    ("Acquisition",      re.compile(r'\b(acqui[rs]|merger|takeover|scheme\s+of\s+arrangement|recommended\s+offer)\b', re.I)),
-    ("Director Dealing", re.compile(r'\b(pdmr|tr-?1|director.{0,15}(dealing|interest|purchase|sale|holding))\b', re.I)),
+    # Meeting outcomes ("Results of AGM") before Results
+    ("AGM/EGM",          re.compile(r'\bresults?\s+of\s+(the\s+)?(agm|egm|annual\s+general|extraordinary\s+general|general|court)\b', re.I)),
+    ("Results",          re.compile(r'\b(results|earnings|revenue|profit|loss|turnover)\b'
+                                    r'|\b(annual|half[\s-]?year(ly)?)\s+financial\s+report\b'
+                                    r'|\bhalf[\s-]?year(ly)?\s+report\b'
+                                    r'|\binterim\s+(report|management\s+statement)\b'
+                                    r'|\bquarterly\s+report\b', re.I)),
+    # New listings only — a bare "Admission to Trading" is almost always a block
+    # admission or debt issue by an existing issuer, so it is not matched
+    ("New Listing",      re.compile(r'\bintention\s+to\s+float\b|\bfirst\s+day\s+of\s+(dealings|trading)\b'
+                                    r'|\badmission\s+to\s+(aim|the\s+main\s+market|the\s+official\s+list|aquis)\b'
+                                    r'|\bipo\b|\binitial\s+public\s+offering\b', re.I)),
+    ("Acquisition",      re.compile(r'\b(acqui(re[sd]?|ring|sitions?)|merger|takeover|scheme\s+of\s+arrangement'
+                                    r'|recommended\s+(cash\s+)?offer|possible\s+offer|firm\s+offer|rule\s+2\.[47]|pusu)\b', re.I)),
+    # TR-1 is a major-shareholder notification, not a director dealing — not matched
+    ("Director Dealing", re.compile(r'\b(pdmrs?|director.{0,15}(dealings?|interests?|purchase|sale|holding)'
+                                    r'|managers.{0,2}\s+and\s+closely)\b', re.I)),
     ("Dividend",         re.compile(r'\b(dividend|distribution)\b', re.I)),
     ("AGM/EGM",          re.compile(r'\b(agm|egm|annual\s+general\s+meeting|extraordinary\s+general\s+meeting)\b', re.I)),
-    ("Placing",          re.compile(r'\b(placing|fundrais|subscription\s+for\s+shares)\b', re.I)),
+    ("Placing",          re.compile(r'\b(placing|fundrais(e|es|ed|ing)|subscription\s+for\s+shares|retail\s+offer|bookbuild(ing)?)\b', re.I)),
     ("Trading Update",   re.compile(r'\b(trading\s+update|trading\s+statement|business\s+update)\b', re.I)),
     ("Share Buyback",    re.compile(r'\b(buy.?back|repurchase)\b', re.I)),
-    ("Appointment",      re.compile(r'\b(appoints?|resign|retire[sd]?|board\s+change)\b', re.I)),
+    ("Appointment",      re.compile(r'\b(appoint(s|ment|ments|ed)?|resign(s|ed|ation)?|retire[sd]?|retirement'
+                                    r'|board\s+(changes?|update)|directorate\s+(changes?|update|resignation))\b', re.I)),
 ]
 
 
 def _detect_category(headline):
     """Return the first category label whose pattern matches the headline, or None."""
+    if not headline or _CATEGORY_EXCLUDE.search(headline):
+        return None
     for label, pattern in _CATEGORY_RULES:
         if pattern.search(headline):
             return label

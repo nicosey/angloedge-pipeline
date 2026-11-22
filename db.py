@@ -415,7 +415,10 @@ def cleanup_collections(max_age_hours=48):
 
 
 # Categories considered high-signal for LLM enrichment (skip routine/admin ones)
-_HIGH_SIGNAL_CATEGORIES = {"Results", "Acquisition", "Trading Update", "Placing", "Director Dealing", "Share Buyback"}
+_HIGH_SIGNAL_CATEGORIES = {
+    "Results", "Acquisition", "Trading Update", "Placing", "Director Dealing", "Share Buyback",
+    "New Listing", "Appointment",
+}
 
 
 def save_rns_announcements(announcements):
