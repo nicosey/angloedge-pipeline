@@ -1234,6 +1234,97 @@ class TestRecoverHeadlines(unittest.TestCase):
         self.assertFalse(in_collector_window(datetime(2026, 11, 23, 2, 0)))
 
 
+# ── routine filings ───────────────────────────────────────────
+
+class TestRoutineFilings(unittest.TestCase):
+
+    def _rt(self, headline, category=""):
+        from routine_filings import routine_type
+        return routine_type(headline, category)
+
+    CASES = [
+        ("Transaction in Own Shares", "", "Transaction in Own Shares"),
+        ("Fuller, Smith & Turner PLC: Transaction in Ow...", "", "Transaction in Own Shares"),
+        ("Holding(s) in Company", "", "Holding(s) in Company"),
+        ("TR-1: Notification of Major Holdings", "", "Holding(s) in Company"),
+        ("EQS-PVR: Nagarro SE: Release according to Art", "", "Holding(s) in Company"),
+        ("Total Voting Rights", "", "Total Voting Rights"),
+        ("Form 8.3 - DCC Energy plc", "", "Form 8 Disclosure"),
+        ("Form 8 (DD) - Beazley plc", "", "Form 8 Disclosure"),
+        ("Irish Takeover Panel - Form 8 - DCC plc", "", "Form 8 Disclosure"),
+        ("Rule 2.9 Announcement", "", "Form 8 Disclosure"),
+        ("Rule 38.5_A - DCC Energy plc", "", "Form 38.5"),
+        ("Final Terms", "", "Final Terms"),
+        ("Gearing Announcement", "", "Gearing Disclosure"),
+        ("Monthly Factsheet as at 31 October 2026", "", "Portfolio Disclosure"),
+        ("Top 10 Holdings", "", "Portfolio Disclosure"),
+        ("Admission to Trading", "", "Block Listing / Admission"),
+        ("Block Listing Six Monthly Return", "", "Block Listing / Admission"),
+        ("Issue of Equity", "", "Block Listing / Admission"),
+        ("Sale of Shares from Treasury", "", "Treasury Shares"),
+        ("EBT Share Purchase", "", "Employee Share Schemes"),
+        ("Exercise of Warrants", "", "Employee Share Schemes"),
+        ("Director Declaration", "", "Director Declaration"),
+        ("Post Stabilisation Notice", "", "Debt Notices"),
+        ("Publication of a Supplementary Prospectus", "", "Debt Notices"),
+        ("Notice of AGM", "AGM/EGM", "Meeting Notices"),
+        ("Compliance with Market Abuse Regulation", "", "Administrative"),
+        ("Kepler Trust Intelligence: New Research", "", "Third-party Research"),
+        # Judged by the model
+        ("Issue of Debt", "", None),
+        ("Rule 2.8 Statement", "", None),
+        ("Result of AGM", "AGM/EGM", None),
+        ("Portfolio Update", "", None),
+        ("Coinsilium Backs Gen Z Founders", "", None),
+        ("Admission to AIM and First Day of Dealings", "New Listing", None),
+        ("Issue of Equity following Placing", "", None),
+        ("", "", None),
+    ]
+
+    def test_cases(self):
+        for headline, category, expected in self.CASES:
+            with self.subTest(headline=headline):
+                self.assertEqual(self._rt(headline, category), expected)
+
+    # Precedence: a substantive category wins over a routine match
+    def test_substantive_category_wins(self):
+        for headline, category in [
+            ("Result of Placing and Total Voting Rights", "Placing"),
+            ("Final Results and TVR", "Results"),
+            ("Director/PDMR Shareholding and TVR", "Director Dealing"),
+            ("Completion of Acquisition and Issue of Equity", "Acquisition"),
+            ("Directorate Change and Total Voting Rights", "Appointment"),
+            ("Trading Update and Transaction in Own Shares", "Trading Update"),
+        ]:
+            with self.subTest(headline=headline):
+                self.assertIsNone(self._rt(headline, category))
+
+    def test_buyback_execution_stays_routine(self):
+        self.assertEqual(self._rt("Daily Buy-back Notification", "Share Buyback"), "Transaction in Own Shares")
+        self.assertEqual(self._rt("Share Repurchase Programme: Transactions of week 21", "Share Buyback"),
+                         "Transaction in Own Shares")
+
+    def test_buyback_launch_is_not_routine(self):
+        self.assertIsNone(self._rt("Launch of Share Buyback Programme", "Share Buyback"))
+
+    def test_non_substantive_category_does_not_win(self):
+        self.assertEqual(self._rt("Result of AGM and Total Voting Rights", "AGM/EGM"), "Total Voting Rights")
+        self.assertEqual(self._rt("Dividend Declaration and TVR", "Dividend"), "Total Voting Rights")
+
+
+class TestEnrichDiagnostics(unittest.TestCase):
+
+    def test_variants_edit_only_the_category_line(self):
+        import ai
+        from enrich_diagnostics import VARIANTS
+        base = ai._RNS_ENRICH_PROMPT
+        other, omitted = VARIANTS["other"](base), VARIANTS["omitted"](base)
+        self.assertIn("Category: Other\n", other)
+        self.assertNotIn("Category:", omitted)
+        self.assertEqual(other.replace("Category: Other\n", ""), omitted)
+        self.assertEqual(omitted, base.replace("Category: {category}\n", ""))
+
+
 # ── github connection test ────────────────────────────────────
 
 class TestGitHubConnection(unittest.TestCase):
