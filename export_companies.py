@@ -28,6 +28,7 @@ from datetime import datetime
 
 from config import log
 from db import init_db, get_rns_for_export
+from routine_filings import routine_type
 
 
 MIN_ANNOUNCEMENTS   = 3
@@ -232,6 +233,8 @@ def format_announcement(row):
 
     `enriched` is the unambiguous marker: false means never scored, true means
     scored (impact_score is then an int 1-10, however low).
+    `routine_type` is the routine filing label from routine_filings.py, or null;
+    the site groups on it and holds no patterns of its own.
     """
     enriched = row["impact_score"] is not None
     return {
@@ -239,6 +242,7 @@ def format_announcement(row):
         "category":     row["category"] or None,
         "headline":     row["headline"],
         "url":          row["url"] or None,
+        "routine_type": routine_type(row["headline"], row["category"]),
         "enriched":     enriched,
         "impact_score": row["impact_score"] if enriched else None,
         "insight":      (row["insight"] or None) if enriched else None,

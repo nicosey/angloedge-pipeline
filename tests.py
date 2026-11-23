@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import tempfile
+from collections import Counter
 from datetime import datetime
 import unittest
 from unittest.mock import patch, MagicMock
@@ -683,8 +684,16 @@ class TestCompanyExportHelpers(unittest.TestCase):
         row = _rns_row(1, "ACM", "2026-05-01T09:00:00")
         row["body"] = "SHOULD NEVER APPEAR"
         a = format_announcement(row)
-        self.assertEqual(set(a), {"timestamp", "category", "headline", "url", "enriched",
+        self.assertEqual(set(a), {"timestamp", "category", "headline", "url", "routine_type", "enriched",
                                   "impact_score", "insight", "key_themes"})
+
+    def test_routine_type_exported(self):
+        from export_companies import format_announcement
+        row = _rns_row(1, "ACM", "2026-05-01T09:00:00")
+        row.update(headline="Transaction in Own Shares", category="")
+        self.assertEqual(format_announcement(row)["routine_type"], "Transaction in Own Shares")
+        row.update(headline="Result of Placing and TVR", category="Placing")
+        self.assertIsNone(format_announcement(row)["routine_type"])
 
 
 class TestExportCompanies(unittest.TestCase):
@@ -1323,6 +1332,158 @@ class TestEnrichDiagnostics(unittest.TestCase):
         self.assertNotIn("Category:", omitted)
         self.assertEqual(other.replace("Category: Other\n", ""), omitted)
         self.assertEqual(omitted, base.replace("Category: {category}\n", ""))
+
+
+# ── blocklist enrichment ──────────────────────────────────────
+
+def _seed_rns(rows):
+    """rows: (rns, headline, category, timestamp)"""
+    import db
+    db.init_db()
+    db.save_rns_announcements([
+        {"rns_number": n, "timestamp": ts, "company_name": "Acme", "ticker": "ACM",
+         "headline": h, "url": "u" + n, "category": c} for n, h, c, ts in rows])
+
+
+class TestBlocklistSelection(unittest.TestCase):
+
+    ROWS = [
+        ("1", "Coinsilium Backs Gen Z Founders", "", "2026-11-20T09:00:00"),
+        ("2", "Transaction in Own Shares", "", "2026-11-20T10:00:00"),
+        ("3", "Result of Placing and TVR", "Placing", "2026-11-20T11:00:00"),
+        ("4", "Daily Buy-back Notification", "Share Buyback", "2026-11-20T12:00:00"),
+        ("5", "Result of AGM", "AGM/EGM", "2026-11-20T13:00:00"),
+        ("6", "Final Results", "Results", "2026-11-20T14:00:00"),
+    ]
+
+    def test_routine_excluded_everything_else_newest_first(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_rns(self.ROWS)
+                db.update_rns_enrichment("6", 7, "x", [])
+                got = db.get_unenriched_rns(limit=50)
+                skipped = db.get_unenriched_rns(limit=50, skip=frozenset({"5"}))
+                one = db.get_unenriched_rns(limit=1)
+        self.assertEqual([r["rns_number"] for r in got], ["5", "3", "1"])
+        self.assertEqual([r["rns_number"] for r in skipped], ["3", "1"])
+        self.assertEqual([r["rns_number"] for r in one], ["5"])
+
+    def test_blank_category_passed_as_constant(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_rns(self.ROWS[:1])
+                got = db.get_unenriched_rns()
+        self.assertEqual(got[0]["category"], db.PROMPT_CATEGORY_FOR_BLANK)
+
+
+class TestTelegramMinScore(unittest.TestCase):
+
+    def test_default_threshold_filters(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), \
+                 patch("db.TELEGRAM_MIN_SCORE", 6):
+                _seed_rns([(str(i), f"Headline {i}", "Results", "2026-11-20T09:00:00") for i in (1, 2, 3)])
+                for n, sc in (("1", 5), ("2", 6), ("3", 9)):
+                    db.update_rns_enrichment(n, sc, "x", [])
+                default = [r["rns_number"] for r in db.get_unpublished_enriched_rns()]
+                explicit = [r["rns_number"] for r in db.get_unpublished_enriched_rns(min_score=1)]
+        self.assertEqual(default, ["3", "2"])
+        self.assertEqual(sorted(explicit), ["1", "2", "3"])
+
+    def test_env_var(self):
+        import importlib, config
+        with patch.dict(os.environ, {"TELEGRAM_MIN_SCORE": "8"}):
+            self.assertEqual(importlib.reload(config).TELEGRAM_MIN_SCORE, 8)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TELEGRAM_MIN_SCORE", None)
+            self.assertEqual(importlib.reload(config).TELEGRAM_MIN_SCORE, 6)
+        importlib.reload(config)
+
+
+class TestEnrichBacklog(unittest.TestCase):
+
+    NOW = datetime(2026, 11, 23, 20, 0)
+
+    def test_guard_selection(self):
+        from enrich_backlog import rows_to_guard
+        rows = [
+            {"rns_number": "old", "timestamp": "2026-10-01T09:00:00", "telegram_published_at": None},
+            {"rns_number": "recent", "timestamp": "2026-11-23T09:00:00", "telegram_published_at": None},
+            {"rns_number": "sent", "timestamp": "2026-10-01T09:00:00", "telegram_published_at": "2026-10-01T10:00:00"},
+            {"rns_number": "bad", "timestamp": "garbage", "telegram_published_at": None},
+            {"rns_number": "legacy", "timestamp": "1 October 2026 09:00 AM", "telegram_published_at": None},
+        ]
+        self.assertEqual(rows_to_guard(rows, self.NOW), ["old", "bad", "legacy"])
+
+    def test_guard_and_eligible_against_db(self):
+        import db
+        from enrich_backlog import eligible_rows, rows_to_guard, apply_guard
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_rns([("1", "Coinsilium Backs Gen Z Founders", "", "2026-10-01T09:00:00"),
+                           ("2", "Holding(s) in Company", "", "2026-10-01T09:00:00"),
+                           ("3", "Predictive Labs Unveils Platform", "", "2026-11-23T15:00:00")])
+                con = db._connect()
+                rows = eligible_rows(con)
+                apply_guard(con, rows_to_guard(rows, self.NOW), "2026-11-23T20:00:00")
+                got = dict(con.execute("SELECT rns_number, telegram_published_at FROM rns_announcements"))
+                con.close()
+        self.assertEqual(sorted(r["rns_number"] for r in rows), ["1", "3"])
+        self.assertEqual(got, {"1": "2026-11-23T20:00:00", "2": None, "3": None})
+
+    def _queue(self, n):
+        self.store = {str(i): None for i in range(n, 0, -1)}       # newest first
+        def get(limit, skip):
+            return [{"rns_number": k} for k, v in self.store.items() if v is None and k not in skip][:limit]
+        def save(rns, score, insight, themes):
+            self.store[rns] = score
+        return get, save
+
+    def _run(self, n, enrich_fn, **kw):
+        from enrich_backlog import enrich
+        get, save = self._queue(n)
+        with patch("enrich_backlog.log"):
+            return enrich(get=get, enrich_fn=enrich_fn, save=save, now=lambda: self.NOW, **kw)
+
+    @staticmethod
+    def _ok(batch):
+        return [(a["rns_number"], {"impact_score": 6, "insight": "x", "key_themes": []}) for a in batch]
+
+    def test_enriches_everything_and_resumes(self):
+        counts = self._run(25, self._ok)
+        self.assertEqual(counts["enriched"], 25)
+        self.assertTrue(all(v == 6 for v in self.store.values()))
+
+    def test_limit(self):
+        counts = self._run(25, self._ok, limit=7)
+        self.assertEqual(counts["enriched"], 7)
+        self.assertEqual(sum(v is not None for v in self.store.values()), 7)
+
+    def test_failures_not_retried_within_run(self):
+        seen = Counter()
+        def flaky(batch):
+            for a in batch: seen[a["rns_number"]] += 1
+            return [r for r in self._ok(batch) if r[0] != "3"]
+        counts = self._run(12, flaky)
+        self.assertEqual((counts["enriched"], counts["failed"]), (11, 1))
+        self.assertEqual(seen["3"], 1)
+
+    def test_aborts_when_model_down(self):
+        from enrich_backlog import MAX_CONSECUTIVE_FAILURES
+        counts = self._run(100, lambda batch: [])
+        self.assertEqual(counts["aborted"], 1)
+        self.assertLess(counts["failed"], MAX_CONSECUTIVE_FAILURES + 10)
+
+    def test_stops_for_collector_window(self):
+        from enrich_backlog import enrich
+        get, save = self._queue(5)
+        with patch("enrich_backlog.log"):
+            counts = enrich(get=get, enrich_fn=self._ok, save=save, now=lambda: datetime(2026, 11, 24, 6, 56))
+        self.assertEqual(counts["stopped_for_window"], 1)
+        self.assertEqual(counts["enriched"], 0)
 
 
 # ── github connection test ────────────────────────────────────

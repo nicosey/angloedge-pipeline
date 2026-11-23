@@ -3,7 +3,8 @@ import json
 import os
 from datetime import datetime
 
-from config import DB_PATH, ARCHIVE_DB_PATH, log
+from config import DB_PATH, ARCHIVE_DB_PATH, TELEGRAM_MIN_SCORE, log
+from routine_filings import routine_type, SUBSTANTIVE_CATEGORIES
 
 
 DB_TIMEOUT = 30  # seconds to wait before raising "locked" error
@@ -414,11 +415,13 @@ def cleanup_collections(max_age_hours=48):
     _db_op(_)
 
 
-# Categories considered high-signal for LLM enrichment (skip routine/admin ones)
-_HIGH_SIGNAL_CATEGORIES = {
-    "Results", "Acquisition", "Trading Update", "Placing", "Director Dealing", "Share Buyback",
-    "New Listing", "Appointment",
-}
+# Substantive collector categories. Enrichment no longer gates on these — it
+# skips routine filings (routine_filings.py) and enriches everything else — but
+# they still win over a routine match there, and backfill_categories.py uses them.
+_HIGH_SIGNAL_CATEGORIES = SUBSTANTIVE_CATEGORIES
+
+# Category passed to the enrichment prompt for uncategorised rows.
+PROMPT_CATEGORY_FOR_BLANK = "Other"
 
 
 def save_rns_announcements(announcements):
@@ -453,19 +456,30 @@ def save_rns_announcements(announcements):
     return _db_op(_)
 
 
-def get_unenriched_rns(limit=50):
-    """Return high-signal RNS rows not yet enriched, newest first."""
+def _connect_with_routine():
+    con = _connect()
+    con.create_function("routine_type", 2, routine_type, deterministic=True)
+    return con
+
+
+def get_unenriched_rns(limit=50, skip=frozenset()):
+    """
+    Return non-routine RNS rows not yet enriched, newest first. Routine filings
+    (routine_filings.py) are never enriched; everything else is, and the model
+    judges significance. rns_numbers in `skip` are left out (e.g. rows that
+    already failed in this run).
+    """
     def _():
-        con = _connect()
-        placeholders = ",".join("?" * len(_HIGH_SIGNAL_CATEGORIES))
+        con = _connect_with_routine()
         rows = con.execute(
-            f"SELECT rns_number, timestamp, company_name, ticker, headline, url, category "
-            f"FROM rns_announcements "
-            f"WHERE impact_score IS NULL AND category IN ({placeholders}) "
-            f"ORDER BY timestamp DESC LIMIT ?",
-            (*_HIGH_SIGNAL_CATEGORIES, limit),
+            "SELECT rns_number, timestamp, company_name, ticker, headline, url, category "
+            "FROM rns_announcements "
+            "WHERE impact_score IS NULL AND routine_type(headline, category) IS NULL "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (limit + len(skip),),
         ).fetchall()
         con.close()
+        rows = [r for r in rows if r[0] not in skip][:limit]
         return [
             {
                 "rns_number":   r[0],
@@ -474,15 +488,19 @@ def get_unenriched_rns(limit=50):
                 "ticker":       r[3],
                 "headline":     r[4],
                 "url":          r[5],
-                "category":     r[6],
+                "category":     r[6] or PROMPT_CATEGORY_FOR_BLANK,
             }
             for r in rows
         ]
     return _db_op(_)
 
 
-def get_unpublished_enriched_rns(min_score=1):
-    """Return enriched RNS rows not yet sent to Telegram, highest impact first."""
+def get_unpublished_enriched_rns(min_score=None):
+    """
+    Return enriched RNS rows not yet sent to Telegram, highest impact first.
+    min_score defaults to TELEGRAM_MIN_SCORE (env, default 6).
+    """
+    min_score = TELEGRAM_MIN_SCORE if min_score is None else min_score
     def _():
         con = _connect()
         rows = con.execute(

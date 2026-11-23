@@ -25,6 +25,13 @@ OLLAMA_ENRICH_MODEL   = os.environ.get("OLLAMA_ENRICH_MODEL",   OLLAMA_BRIEFING_
 DB_PATH            = os.environ.get("BRIEFING_DB",  os.path.join("output", "briefings.db"))
 ARCHIVE_DB_PATH    = os.environ.get("BRIEFING_ARCHIVE_DB", os.path.join("output", "archive.db"))
 
+# Telegram push bar: only enriched RNS rows scoring at least this are posted.
+# Push notifications only — site display thresholds are separate.
+try:
+    TELEGRAM_MIN_SCORE = int(os.environ.get("TELEGRAM_MIN_SCORE", "6"))
+except ValueError:
+    raise SystemExit(f"TELEGRAM_MIN_SCORE must be an integer, got {os.environ['TELEGRAM_MIN_SCORE']!r}")
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
