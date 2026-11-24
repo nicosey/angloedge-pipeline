@@ -5,6 +5,7 @@ from datetime import datetime
 
 from config import DB_PATH, ARCHIVE_DB_PATH, TELEGRAM_MIN_SCORE, log
 from routine_filings import routine_type, SUBSTANTIVE_CATEGORIES
+from ai import RNS_PROMPT_VERSION
 
 
 DB_TIMEOUT = 30  # seconds to wait before raising "locked" error
@@ -131,6 +132,7 @@ def init_db():
             "ADD COLUMN key_themes TEXT",
             "ADD COLUMN enriched_at TEXT",
             "ADD COLUMN telegram_published_at TEXT",
+            "ADD COLUMN enrichment_version INTEGER",   # NULL = version 1 (before versioning)
         ):
             try:
                 con.execute(f"ALTER TABLE rns_announcements {col_def}")
@@ -462,21 +464,35 @@ def _connect_with_routine():
     return con
 
 
-def get_unenriched_rns(limit=50, skip=frozenset()):
+# Rows needing enrichment. The second clause (include_stale) adds rows enriched
+# under an older prompt version, routine or not, so their insight is replaced.
+ENRICH_WORK_SQL = (
+    "(impact_score IS NULL AND routine_type(headline, category) IS NULL)")
+STALE_ENRICHMENT_SQL = (
+    "(impact_score IS NOT NULL AND COALESCE(enrichment_version, 1) < ?)")
+
+
+def get_unenriched_rns(limit=50, skip=frozenset(), include_stale=False):
     """
     Return non-routine RNS rows not yet enriched, newest first. Routine filings
     (routine_filings.py) are never enriched; everything else is, and the model
     judges significance. rns_numbers in `skip` are left out (e.g. rows that
     already failed in this run).
+
+    include_stale=True (enrich_backlog.py) also returns rows enriched under an
+    older RNS_PROMPT_VERSION, so they are re-enriched with the current prompt.
+    The live half-hourly path leaves it False.
     """
     def _():
         con = _connect_with_routine()
+        where, args = ENRICH_WORK_SQL, []
+        if include_stale:
+            where, args = f"({ENRICH_WORK_SQL} OR {STALE_ENRICHMENT_SQL})", [RNS_PROMPT_VERSION]
         rows = con.execute(
             "SELECT rns_number, timestamp, company_name, ticker, headline, url, category "
-            "FROM rns_announcements "
-            "WHERE impact_score IS NULL AND routine_type(headline, category) IS NULL "
+            f"FROM rns_announcements WHERE {where} "
             "ORDER BY timestamp DESC LIMIT ?",
-            (limit + len(skip),),
+            (*args, limit + len(skip)),
         ).fetchall()
         con.close()
         rows = [r for r in rows if r[0] not in skip][:limit]
@@ -544,19 +560,22 @@ def mark_rns_published(rns_number):
     _db_op(_)
 
 
-def update_rns_enrichment(rns_number, impact_score, insight, key_themes):
-    """Write LLM enrichment fields back to an rns_announcements row."""
+def update_rns_enrichment(rns_number, impact_score, insight, key_themes,
+                          version=RNS_PROMPT_VERSION):
+    """Write LLM enrichment fields back to an rns_announcements row, stamped with
+    the prompt version that produced them."""
     def _():
         con = _connect()
         con.execute(
             "UPDATE rns_announcements "
-            "SET impact_score=?, insight=?, key_themes=?, enriched_at=? "
+            "SET impact_score=?, insight=?, key_themes=?, enriched_at=?, enrichment_version=? "
             "WHERE rns_number=?",
             (
                 impact_score,
                 insight,
                 json.dumps(key_themes) if isinstance(key_themes, list) else key_themes,
                 datetime.now().isoformat(timespec="seconds"),
+                version,
                 rns_number,
             ),
         )

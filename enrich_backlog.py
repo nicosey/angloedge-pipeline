@@ -1,5 +1,7 @@
 """
-Enrich the backlog of unenriched, non-routine RNS announcements.
+Enrich the backlog: unenriched non-routine RNS announcements, plus every row
+enriched under an older prompt (ai.RNS_PROMPT_VERSION), which is re-enriched in
+place with the current prompt.
 
 Usage:
   python3 enrich_backlog.py              Guard the backlog from Telegram, then enrich it
@@ -9,11 +11,13 @@ Usage:
                                          the whole backlog)
   python3 enrich_backlog.py --force      Run inside the RNS collector's window (testing only)
 
-Selection and enrichment are exactly the live path: db.get_unenriched_rns
-(routine filings excluded, see routine_filings.py), ai.enrich_rns_with_llm and
-db.update_rns_enrichment. Newest first.
+Selection and enrichment are the live path: db.get_unenriched_rns with
+include_stale=True (routine filings excluded unless they already carry an
+old-version enrichment), ai.enrich_rns_with_llm and db.update_rns_enrichment,
+which stamps the current version. Newest first. A re-enriched row keeps its old
+enrichment until the new one is saved, so a failed call loses nothing.
 
-Telegram guard: before any enrichment, every eligible unenriched row older than
+Telegram guard: before any enrichment, every eligible row older than
 GUARD_AGE_HOURS (or with an unparseable timestamp) that has never been sent gets
 telegram_published_at set to the run time, in one transaction. It covers the
 whole backlog even under --limit, because once the blocklist is live the
@@ -41,13 +45,18 @@ MAX_CONSECUTIVE_FAILURES = 20     # model down or unparseable output: stop
 
 
 def eligible_rows(con):
-    """All unenriched, non-routine rows: rns_number, timestamp, category, telegram_published_at."""
+    """Rows to (re-)enrich: rns_number, timestamp, category, telegram_published_at, stale."""
     con.create_function("routine_type", 2, db.routine_type, deterministic=True)
     cur = con.execute(
-        "SELECT rns_number, timestamp, category, telegram_published_at FROM rns_announcements "
-        "WHERE impact_score IS NULL AND routine_type(headline, category) IS NULL")
-    return [dict(zip(("rns_number", "timestamp", "category", "telegram_published_at"), r))
+        "SELECT rns_number, timestamp, category, telegram_published_at, "
+        "       impact_score IS NOT NULL FROM rns_announcements "
+        f"WHERE {db.ENRICH_WORK_SQL} OR {db.STALE_ENRICHMENT_SQL}", (db.RNS_PROMPT_VERSION,))
+    return [dict(zip(("rns_number", "timestamp", "category", "telegram_published_at", "stale"), r))
             for r in cur.fetchall()]
+
+
+def _get_work(limit, skip):
+    return db.get_unenriched_rns(limit=limit, skip=skip, include_stale=True)
 
 
 def rows_to_guard(rows, now):
@@ -72,7 +81,7 @@ def apply_guard(con, rns_numbers, run_time):
 
 def enrich(limit=None, force=False, now=datetime.now, get=None, enrich_fn=None, save=None):
     """Enrich newest-first in batches; returns a Counter of outcomes."""
-    get = get or db.get_unenriched_rns
+    get = get or _get_work
     enrich_fn = enrich_fn or ai.enrich_rns_with_llm
     save = save or db.update_rns_enrichment
     counts, failed, consecutive = Counter(), set(), 0
@@ -130,7 +139,9 @@ def main(argv):
         rows = eligible_rows(con)
         guard = rows_to_guard(rows, datetime.now())
         by_cat = Counter((r["category"] or "(none)") for r in rows)
-        log(f"🔎 Eligible (unenriched, non-routine): {len(rows)}  — model {OLLAMA_ENRICH_MODEL}")
+        stale = sum(1 for r in rows if r["stale"])
+        log(f"🔎 To enrich: {len(rows)}  ({len(rows) - stale} new, {stale} re-enriched from an older "
+            f"prompt)  — model {OLLAMA_ENRICH_MODEL}, prompt v{db.RNS_PROMPT_VERSION}")
         for cat, n in by_cat.most_common():
             log(f"    {n:6}  {cat}")
         log(f"🛡  Telegram guard: {len(guard)} row(s) older than {GUARD_AGE_HOURS}h "
@@ -153,7 +164,7 @@ def main(argv):
         log("Scores:   " + "  ".join(f"{s}:{n}" for s, n in sorted(scores.items(), key=lambda x: int(x[0]))))
     con = db._connect()
     try:
-        log(f"Remaining eligible: {len(eligible_rows(con))}")
+        log(f"Remaining: {len(eligible_rows(con))}")
     finally:
         con.close()
     return 0

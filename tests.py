@@ -1488,6 +1488,317 @@ class TestEnrichBacklog(unittest.TestCase):
 
 # ── github connection test ────────────────────────────────────
 
+class TestPromptV2(unittest.TestCase):
+    """Headline-only prompt (v2), no score floors, versioned re-enrichment."""
+
+    def test_prompt_forbids_outside_facts(self):
+        import ai
+        p = ai._RNS_ENRICH_PROMPT
+        self.assertGreaterEqual(ai.RNS_PROMPT_VERSION, 2)
+        for phrase in ("Reason only from the company name, category and headline",
+                       "Never name a company, person, product, project, place, amount, percentage or date",
+                       "generally signifies for shareholders, without inventing specifics"):
+            self.assertIn(phrase, p)
+        for gone in ("precedent", "sector trends", "Never generic"):
+            self.assertNotIn(gone, p.replace("peers, precedents", ""))
+        filled = p.format(company="Acme", ticker="ACM", category="Other", headline="Offer")
+        self.assertIn("Headline: Offer", filled)
+
+    def test_no_score_floor(self):
+        import ai
+        for cat in ("Acquisition", "Results", "Trading Update", "Placing", "Director Dealing", ""):
+            got = ai._parse_enrichment_json('{"impact_score": 2, "insight": "x", "key_themes": []}', cat)
+            self.assertEqual(got["impact_score"], 2, cat)
+        self.assertFalse(hasattr(ai, "_SCORE_FLOORS"))
+
+    ROWS = [
+        ("1", "Unscored news", "", "2026-11-20T09:00:00"),
+        ("2", "Old prompt news", "", "2026-11-20T10:00:00"),
+        ("3", "Transaction in Own Shares", "", "2026-11-20T11:00:00"),   # routine, old enrichment
+        ("4", "Holding(s) in Company", "", "2026-11-20T12:00:00"),       # routine, never enriched
+        ("5", "Current prompt news", "", "2026-11-20T13:00:00"),
+    ]
+
+    def _seed(self):
+        import db, sqlite3
+        _seed_rns(self.ROWS)
+        db.update_rns_enrichment("2", 6, "old", [], version=None)
+        db.update_rns_enrichment("3", 5, "old", [], version=1)
+        db.update_rns_enrichment("5", 4, "new", [])
+
+    def test_save_stamps_current_version(self):
+        import db, ai, sqlite3
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "t.db")
+            with patch("db.DB_PATH", path), patch("db.log"):
+                self._seed()
+            con = sqlite3.connect(path)
+            got = dict(con.execute("SELECT rns_number, enrichment_version FROM rns_announcements"))
+        self.assertEqual(got, {"1": None, "2": None, "3": 1, "4": None, "5": ai.RNS_PROMPT_VERSION})
+
+    def test_live_selection_unchanged_backlog_includes_stale(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                self._seed()
+                live = db.get_unenriched_rns(limit=50)
+                backlog = db.get_unenriched_rns(limit=50, include_stale=True)
+                skipped = db.get_unenriched_rns(limit=50, include_stale=True, skip=frozenset({"3"}))
+        self.assertEqual([r["rns_number"] for r in live], ["1"])
+        self.assertEqual([r["rns_number"] for r in backlog], ["3", "2", "1"])    # newest first
+        self.assertEqual([r["rns_number"] for r in skipped], ["2", "1"])
+
+    def test_backlog_counts_stale_and_guards_them(self):
+        import db, enrich_backlog as eb
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                self._seed()
+                con = db._connect()
+                rows = eb.eligible_rows(con)
+                guard = eb.rows_to_guard(rows, datetime(2026, 11, 24, 17, 0))
+                con.close()
+        self.assertEqual({r["rns_number"]: bool(r["stale"]) for r in rows},
+                         {"1": False, "2": True, "3": True})
+        self.assertEqual(sorted(guard), ["1", "2", "3"])
+
+    def test_reenrichment_replaces_and_stamps(self):
+        import db, ai, enrich_backlog as eb
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"), patch("enrich_backlog.log"):
+                self._seed()
+                fake = lambda batch: [(a["rns_number"], {"impact_score": 3, "insight": "v2", "key_themes": []})
+                                      for a in batch]
+                counts = eb.enrich(force=True, enrich_fn=fake)
+                con = db._connect()
+                left = eb.eligible_rows(con)
+                rows = con.execute("SELECT rns_number, insight, enrichment_version FROM rns_announcements "
+                                   "ORDER BY rns_number").fetchall()
+                con.close()
+        self.assertEqual(counts["enriched"], 3)
+        self.assertEqual(left, [])
+        self.assertEqual(rows, [("1", "v2", ai.RNS_PROMPT_VERSION), ("2", "v2", ai.RNS_PROMPT_VERSION),
+                                ("3", "v2", ai.RNS_PROMPT_VERSION), ("4", None, None),
+                                ("5", "new", ai.RNS_PROMPT_VERSION)])
+
+
+class TestRnsDigest(unittest.TestCase):
+    def _con(self, rows):
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE rns_announcements (rns_number, timestamp, company_name, ticker, "
+                    "headline, impact_score, insight)")
+        con.executemany("INSERT INTO rns_announcements VALUES (?,?,?,?,?,?,?)", rows)
+        con.commit()
+        return con
+
+    def test_selects_by_announcement_day_and_score(self):
+        import rns_digest as d
+        from datetime import date
+        con = self._con([
+            ("1", "2026-11-23T08:00:00", "A plc", "AAA", "Offer", 9, "x"),
+            ("2", "2026-11-22T08:00:00", "B plc", "BBB", "Old news enriched today", 10, "x"),
+            ("3", "2026-11-23T09:00:00", "C plc", "CCC", "Small", 6, "x"),
+            ("4", "2026-11-23T10:00:00", "D plc", "DDD", "Later", 9, "x"),
+            ("5", "2026-11-23T11:00:00", "E plc", "EEE", "Unscored", None, None),
+        ])
+        rows = d.rows_for_day(con, date(2026, 11, 23), 7)
+        self.assertEqual([r["rns_number"] for r in rows], ["4", "1"])   # score, then latest
+
+    def test_one_per_company_and_top(self):
+        import rns_digest as d
+        rows = [{"rns_number": n, "ticker": t, "company_name": t} for n, t in
+                [("1", "AAA"), ("2", "AAA"), ("3", "BBB"), ("4", "CCC")]]
+        self.assertEqual([r["rns_number"] for r in d.pick(rows, 2)], ["1", "3"])
+
+    def test_display_headline_keeps_other_prefixes(self):
+        import rns_digest as d
+        self.assertEqual(d.display_headline("Rule 2.7: Firm Offer", "Acme plc"), "Rule 2.7: Firm Offer")
+        self.assertEqual(d.display_headline("Acme: Results", "Acme Group plc"), "Results")
+        self.assertEqual(d.display_headline("No colon here", "Acme plc"), "No colon here")
+
+    def test_company_count_label(self):
+        import rns_digest as d
+        self.assertEqual(d.company_count_label(1722), "1,700+")
+        self.assertEqual(d.company_count_label(2001), "2,000+")
+        self.assertEqual(d.company_count_label(42), "42")
+
+    def test_x_length(self):
+        import rns_digest as d
+        self.assertEqual(d.x_length("abc"), 3)
+        self.assertEqual(d.x_length("📋"), 2)
+        self.assertEqual(d.x_length("→"), 2)
+        self.assertEqual(d.x_length("—£é"), 3)
+        self.assertEqual(d.x_length("see angloedge.com/companies now"), 4 + 23 + 4)
+
+    def _item(self, insight, headline="Recommended All Share Offer", company="Reabold Resources"):
+        return {"ticker": "RBD", "company": company, "slug": "reabold-rbd", "score": 9,
+                "headline": headline, "insight": insight, "timestamp": "2026-11-23T08:00:00"}
+
+    def test_posts_short_insight_kept_whole(self):
+        import rns_digest as d
+        from datetime import date
+        posts = d.build_posts([self._item("A recommended offer is likely to complete.")], 1722, date(2026, 11, 23))
+        self.assertEqual(posts, [
+            "Highest-impact UK RNS today 📋\nMon 23 November 2026",
+            "$RBD Reabold Resources — 9/10\nRecommended All Share Offer\nA recommended offer is likely to complete.",
+            "Scored filing history for 1,700+ UK companies → angloedge.com/companies"])
+
+    def test_posts_trimmed_to_limit(self):
+        import rns_digest as d
+        from datetime import date
+        long_sentences = "First sentence is short. " + "Second sentence goes on and on " * 12 + "."
+        one_long = "word " * 120
+        for insight in (long_sentences, one_long):
+            post = d.build_posts([self._item(insight)], 1722, date(2026, 11, 23))[1]
+            self.assertLessEqual(d.x_length(post), d.POST_LIMIT)
+            self.assertIn("Recommended All Share Offer", post)
+        self.assertTrue(d.build_posts([self._item(long_sentences)], 1, date(2026, 11, 23))[1]
+                        .endswith("First sentence is short."))
+        self.assertTrue(d.build_posts([self._item(one_long)], 1, date(2026, 11, 23))[1].endswith("…"))
+        huge = d.build_posts([self._item("x", headline="H " * 300, company="C " * 200)], 1, date(2026, 11, 23))[1]
+        self.assertLessEqual(d.x_length(huge), d.POST_LIMIT)
+
+    def test_delimiter_never_inside_a_post(self):
+        import rns_digest as d
+        from datetime import date
+        posts = d.build_posts([self._item("Line one\n---\nline two")], 1, date(2026, 11, 23))
+        self.assertFalse(any(line.strip() == "---" for p in posts for line in p.split("\n")))
+
+    def test_empty_day_has_no_posts(self):
+        import rns_digest as d
+        from datetime import date
+        dg = d.build_digest([], {}, 1722, date(2026, 11, 22))
+        self.assertEqual((dg["date"], dg["items"], dg["posts"]), ("2026-11-22", [], []))
+
+    def test_telegram_format_escapes(self):
+        import rns_digest as d
+        from datetime import date
+        dg = {"items": [self._item("Big <deal> & it's final")], "posts": ["t", "footer → x"]}
+        m = d.format_telegram(dg)
+        self.assertIn("Big &lt;deal&gt; &amp; it's final", m)
+        self.assertTrue(m.endswith("footer → x"))
+
+    # ── end to end with a temp site repo and fake git ──
+
+    def _run(self, argv, tmp, deliver=None):
+        import rns_digest as d
+        import sqlite3
+        repo = os.path.join(tmp, "site")
+        os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+        os.makedirs(os.path.join(repo, "src", "data", "companies"), exist_ok=True)
+        with open(os.path.join(repo, "src", "data", "companies-index.json"), "w") as f:
+            json.dump([{"ticker": "AAA", "slug": "a-aaa"}, {"ticker": "BBB", "slug": "b-bbb"}], f)
+        path = os.path.join(tmp, "t.db")
+        if not os.path.exists(path):
+            src = self._con([("1", datetime.now().strftime("%Y-%m-%dT08:00:00"), "A plc", "AAA", "Offer", 9, "x")])
+            src.execute("VACUUM INTO ?", (path,))
+        calls = []
+        env = {"GITHUB_REPO_PATH": repo, "GITHUB_COMPANIES_DIR": "src/data/companies"}
+        with patch.dict(os.environ, env), patch.object(d, "SENT_DIR", os.path.join(tmp, "sent")), \
+             patch.object(d.db, "init_db"), patch.object(d.db, "_connect", side_effect=lambda: sqlite3.connect(path)), \
+             patch("rns_digest.log"), patch("export_companies.log"):
+            rc = d.main(argv, deliver=deliver, git=lambda repo, *a: calls.append(a) or "")
+        out = os.path.join(repo, "src", "data", "rns-today.json")
+        data = None
+        if os.path.exists(out):
+            with open(out) as f:
+                data = json.load(f)
+        return rc, calls, data
+
+    def test_writes_site_file_and_commits_only_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, calls, data = self._run([], tmp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(data["items"][0]["slug"], "a-aaa")
+            self.assertEqual(len(data["posts"]), 3)
+            self.assertIn(("add", "-A", "--", "src/data/rns-today.json"), calls)
+            self.assertTrue(any(c[0] == "push" for c in calls))
+            rc, calls2, _ = self._run([], tmp)                     # same content again
+            self.assertEqual(calls2, [])
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, calls, data = self._run(["--dry-run"], tmp)
+            self.assertEqual((rc, calls, data), (0, [], None))
+
+    def test_telegram_is_opt_in_and_once_per_day(self):
+        sent = []
+        deliver = lambda m: sent.append(m) or True
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run([], tmp, deliver)
+            self.assertEqual(sent, [])                                    # not the default
+            self.assertEqual(self._run(["--telegram"], tmp, deliver)[0], 0)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(self._run(["--telegram"], tmp, deliver)[0], 1)
+            self.assertEqual(len(sent), 1)
+
+    def test_failed_telegram_send_leaves_no_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run(["--telegram"], tmp, lambda m: False)[0], 1)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "sent")))
+
+
+class TestInsightAudit(unittest.TestCase):
+    def test_baseline_file(self):
+        import enrich_diagnostics as d
+        b = d.load_baseline()
+        self.assertEqual(b["counts"], {"unsupported": 11, "outside": 8, "clean": 31})
+        self.assertEqual(len(b["rows"]), 50)
+        self.assertEqual(d.breakdown([r["label"] for r in b["rows"]]),
+                         "unsupported 11 (22%) · outside 8 (16%) · clean 31 (62%)")
+
+    def test_breakdown_ignores_unparsed(self):
+        import enrich_diagnostics as d
+        self.assertEqual(d.breakdown(["clean", None, "outside", "clean"]),
+                         "unsupported 0 (0%) · outside 1 (33%) · clean 2 (67%)")
+
+    def test_judge_parses_and_rejects(self):
+        import enrich_diagnostics as d
+        row = {"company_name": "A", "category": None, "headline": "H", "insight": "I"}
+        with patch.object(d.ai, "_ollama_call", return_value='x {"label": "Outside", "reason": "macro"} y'):
+            self.assertEqual(d.judge(row), ("outside", "macro"))
+        with patch.object(d.ai, "_ollama_call", return_value='{"label": "maybe"}'):
+            self.assertIsNone(d.judge(row)[0])
+        with patch.object(d.ai, "_ollama_call", return_value=None):
+            self.assertIsNone(d.judge(row)[0])
+
+    def test_audit_samples_current_version_only_and_writes_sheet(self):
+        import db, ai, sqlite3, enrich_diagnostics as d
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_rns([(str(i), f"News {i}", "", f"2026-11-20T{9 + i % 8:02d}:00:00") for i in range(10)])
+                for i in range(10):
+                    db.update_rns_enrichment(str(i), 5, f"insight {i}", [], version=None if i < 4 else ai.RNS_PROMPT_VERSION)
+                con = db._connect()
+                with patch("enrich_diagnostics.log"):
+                    rows = d.audit(con, 50, 1, judge_fn=lambda r: ("clean", ""), out_dir=os.path.join(tmpdir, "a"),
+                                   today=datetime(2026, 11, 25))
+                con.close()
+            self.assertEqual(sorted(r["rns_number"] for r in rows), [str(i) for i in range(4, 10)])
+            sheet = os.path.join(tmpdir, "a", f"insights_v{ai.RNS_PROMPT_VERSION}_2026-11-25.json")
+            with open(sheet) as f:
+                data = json.load(f)
+        self.assertEqual(data["judge_counts"], {"clean": 6})
+        self.assertTrue(all(r["human_label"] == "" for r in data["rows"]))
+
+    def test_calibrate_reports_agreement(self):
+        import enrich_diagnostics as d
+        with patch("enrich_diagnostics.log"):
+            pairs = d.audit_calibrate(judge_fn=lambda r: ("clean", ""))
+        self.assertEqual(sum(a == b for a, b in pairs), 31)
+
+
+class TestOutsideTerms(unittest.TestCase):
+    def test_flags_invented_names_only(self):
+        from enrich_diagnostics import outside_terms as o
+        self.assertEqual(o("Finalises the acquisition of iSoftStone.", "Elecosoft Court Sanction"), ["iSoftStone"])
+        self.assertEqual(o("Mirroring collapses like Wirecard's.", "Distil Appoint Admin'rs"), ["Wirecard"])
+        self.assertEqual(o("Advances the Senala project in Sierra Leone.", "Oriole Completion of Senala JV"),
+                         ["Sierra Leone"])
+        self.assertEqual(o("Securing $7m of orders.", "Concurrent $7m Production Orders"), [])
+        self.assertEqual(o("A formal sale process means the board seeks offers.", "Futura Formal Sale Process"), [])
+
+
 class TestGitHubConnection(unittest.TestCase):
     """Integration test — only runs if GITHUB_REPO_PATH is set in env."""
 

@@ -284,44 +284,62 @@ _MOCK_NARRATIVE = (
 )
 
 
-_RNS_ENRICH_PROMPT = """\
-You are a sharp, market-savvy financial analyst specialising in UK equity markets.
+# Bump when the enrichment prompt or scoring changes: rows enriched under an
+# older version are re-enriched by enrich_backlog.py (column enrichment_version).
+RNS_PROMPT_VERSION = 2
 
-Analyse this RNS announcement and respond with ONLY a valid JSON object — no explanation, no preamble, no markdown.
+_RNS_ENRICH_PROMPT = """\
+You are a careful UK equities analyst. You are given ONLY the company name, ticker,
+category and headline of a regulatory announcement (RNS). You have NOT seen the
+announcement itself and you have no other information about the company.
 
 Company: {company} ({ticker})
 Category: {category}
 Headline: {headline}
 
-Required JSON format:
+The category was assigned automatically from the headline's wording and may be wrong;
+judge the headline itself.
+
+Respond with ONLY a valid JSON object — no explanation, no preamble, no markdown:
 {{
   "impact_score": <integer 1-10>,
-  "insight": "<1-2 sentences: specific commentary — why this matters, any sector context, precedent or implication>",
+  "insight": "<1-2 sentences on what this announcement means for shareholders>",
   "key_themes": ["<tag1>", "<tag2>"]
 }}
 
-Scoring guide:
-- 8-10: Transformative (major M&A, significant profit warning, CEO departure, large capital raise)
-- 5-7:  Notable but routine (interim results, moderate trading update, minor capital action)
-- 1-4:  Minor/administrative (small buyback tranche, routine director dealing)
+Rules for the insight — follow all of them:
+- Reason only from the company name, category and headline above.
+- Never name a company, person, product, project, place, amount, percentage or date
+  that does not appear in the headline or the company name.
+- Do not describe what the company does, its sector, history, strategy, finances or
+  recent events unless the headline itself says so. Do not mention competitors,
+  peers, precedents, market conditions or other companies' events.
+- Do not guess the outcome, size, terms or reasons for anything the headline does not state.
+- If the headline alone does not support a specific point, say what this type of
+  announcement generally signifies for shareholders, without inventing specifics.
 
-Insight style: specific and sharp — cite sector trends, recent precedents, or strategic implications. Never generic.\
+key_themes: 1-3 short generic tags (for example "M&A", "Capital raise", "Governance",
+"Results"). No names that are not in the headline.
+
+Scoring guide — how much the announcement could matter to the company's shareholders:
+- 9-10: a firm or recommended offer for the company, a transformative merger,
+  administration or insolvency, suspension of shares, a severe profit warning
+- 7-8:  a possible offer or formal sale process, a material acquisition or disposal,
+  a large fundraise, departure of the CEO or chair, a strategic review, a guidance change
+- 5-6:  scheduled results or a trading update whose direction the headline doesn't
+  state, a contract or partnership described without its size, a board change
+- 3-4:  director dealings, a dividend declaration, a results-date notice, meeting
+  results, small capital actions
+- 1-2:  administrative housekeeping, and press releases about other organisations or
+  marketing material with no bearing on the company's shareholders\
 """
 
 
-# Minimum impact_score by category — catches obvious model under-scoring
-_SCORE_FLOORS = {
-    "Acquisition":     6,
-    "Results":         5,
-    "Trading Update":  4,
-    "Placing":         4,
-    "Director Dealing": 3,
-    "Share Buyback":   3,
-}
-
-
 def _parse_enrichment_json(text, category=""):
-    """Extract the first JSON object from model output. Returns dict or None."""
+    """Extract the first JSON object from model output. Returns dict or None.
+    `category` is accepted for compatibility and no longer used: there is no
+    per-category score floor (the category is a keyword guess, and clamping let
+    that guess overrule the model — e.g. PR-wire filler held at 6)."""
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if not m:
         return None
@@ -332,10 +350,6 @@ def _parse_enrichment_json(text, category=""):
         themes = data.get("key_themes", [])
         if not isinstance(score, int) or not (1 <= score <= 10):
             return None
-        floor = _SCORE_FLOORS.get(category, 1)
-        if score < floor:
-            log(f"    ⚠ score {score} below floor {floor} for {category!r} — clamping")
-            score = floor
         if not isinstance(themes, list):
             themes = [themes] if themes else []
         return {
