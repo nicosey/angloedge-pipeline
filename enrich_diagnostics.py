@@ -195,7 +195,7 @@ def compare_prompt(con, n, seed):
     log(f"Re-scoring {len(known)} known cases + {len(rows) - len(known)} random rows with prompt "
         f"v{ai.RNS_PROMPT_VERSION} on {OLLAMA_ENRICH_MODEL}. Nothing is written.\n")
 
-    old_flagged = new_flagged = fails = 0
+    old_flagged = new_flagged = fails = old_formulaic = new_formulaic = 0
     pairs = []
     started = time.monotonic()
     cache = {}
@@ -207,7 +207,8 @@ def compare_prompt(con, n, seed):
                           + [h["headline"] for h in row["history"]])
         old_terms = outside_terms(row["insight"] or "", source)
         old_flagged += bool(old_terms)
-        tag = "known" if i <= len(known) else "random"
+        old_formulaic += ai.is_formulaic(row["insight"])
+        tag ="known" if i <= len(known) else "random"
         log(f"[{i}/{len(rows)} {tag}] {row['company_name']} — {row['headline']}")
         for h in row["history"]:
             log(f"          earlier {h['date']}: {h['headline'][:80]}")
@@ -220,6 +221,7 @@ def compare_prompt(con, n, seed):
             continue
         new_terms = outside_terms(parsed["insight"], source)
         new_flagged += bool(new_terms)
+        new_formulaic += ai.is_formulaic(parsed["insight"])
         pairs.append((row["impact_score"], parsed["impact_score"]))
         log(f"   new {parsed['impact_score']:>2}: {parsed['insight']}")
         if new_terms:
@@ -231,6 +233,8 @@ def compare_prompt(con, n, seed):
     log(f"Rows: {len(rows)}  parse failures: {fails}  ({per_call:.1f}s/call — "
         f"16,500 rows ≈ {16_500 * per_call / 3600:.1f} h; window 16:35–06:55 is 14.3 h)")
     log(f"Insights with outside terms: old {old_flagged}/{len(rows)}, new {new_flagged}/{done}")
+    log(f"Formulaic insights (\"This announcement…\", \"typically signifies\"): "
+        f"old {old_formulaic}/{len(rows)}, new {new_formulaic}/{done}")
     if pairs:
         diffs = [b - a for a, b in pairs]
         log(f"Score new − old: mean {st.mean(diffs):+.2f}; higher {sum(d > 0 for d in diffs)}, "

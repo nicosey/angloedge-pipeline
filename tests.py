@@ -1499,13 +1499,25 @@ class TestPromptV2(unittest.TestCase):
                        "Never name a company, person, product, project, place, amount, percentage or date",
                        'do not write "the headline"', "at most 2 sentences and 40 words"):
             self.assertIn(phrase, p)
-        for gone in ("sector trends", "Never generic", "Reason only from the company name"):
+        self.assertIn('never with "This\n  announcement"', p)
+        self.assertIn("not a definition of the announcement type", p)
+        for gone in ("sector trends", "Never generic", "Reason only from the company name",
+                     "state plainly\n  what this kind of announcement means"):
             self.assertNotIn(gone, p)
         filled = ai.build_rns_prompt({"company_name": "Acme", "ticker": "ACM", "category": None,
                                       "headline": "Offer"})
         self.assertIn("Announcement: Offer", filled)
         self.assertIn("Category: Other", filled)
         self.assertIn("(none on record)", filled)
+
+    def test_is_formulaic(self):
+        import ai
+        for s in ("This announcement signifies a step forward.", "The headline indicates a deal.",
+                  "This signifies progress.", "A placing typically signals a need for cash."):
+            self.assertTrue(ai.is_formulaic(s), s)
+        for s in ("Gamma's clarification deadline follows its September possible offer.",
+                  "Acme has now issued three trading updates since June.", ""):
+            self.assertFalse(ai.is_formulaic(s), s)
 
     def test_no_score_floor(self):
         import ai

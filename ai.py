@@ -329,8 +329,15 @@ Rules for the insight — follow all of them:
 - Do not guess the outcome, size, terms or reasons for anything not stated above.
 - Write about the announcement, never about its title or wording, and never about
   what is missing: do not write "the headline", "the title", "does not specify",
-  "not disclosed" or "no details". If there is nothing specific to add, state plainly
-  what this kind of announcement means for shareholders.
+  "not disclosed" or "no details".
+- Start with the company's name or with what happened, never with "This
+  announcement", "This headline", "This filing" or "This signifies".
+- Say something specific to THIS company, not a definition of the announcement type.
+  Use what is above: the amounts, names and terms in the title, and how it fits the
+  earlier announcements (the next step in a sequence, a repeat, a change of course, the
+  first such filing in the past year). Never explain what a category of announcement
+  generally means. If nothing specific can be said, write one short plain sentence on
+  what shareholders should watch for next.
 
 key_themes: 1-3 short generic tags (for example "M&A", "Capital raise", "Governance",
 "Results"). No names that are not above.
@@ -347,6 +354,18 @@ Scoring guide — how much the announcement could matter to the company's shareh
 - 1-2:  administrative housekeeping, and press releases about other organisations or
   marketing material with no bearing on the company's shareholders\
 """
+
+
+_FORMULAIC_RE = re.compile(
+    r"^\s*(this|the)\s+(announcement|headline|filing|news|update|release)\b"
+    r"|^\s*this\s+(signifies|indicates|suggests|means)\b"
+    r"|\b(typically|generally|usually)\s+(signifies|indicates|signals|means|suggests)\b", re.I)
+
+
+def is_formulaic(insight):
+    """True for the stock openings and category-definition phrasing the prompt forbids
+    (measured by enrich_diagnostics.py; the insight is never rewritten)."""
+    return bool(_FORMULAIC_RE.search(insight or ""))
 
 
 def _parse_enrichment_json(text, category=""):
