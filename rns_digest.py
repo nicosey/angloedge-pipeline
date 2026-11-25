@@ -1,5 +1,6 @@
 """
-Daily digest of the day's highest-impact RNS announcements, published to the site.
+Daily digest of the day's highest-impact UK market announcements (RNS and other
+wires), published to the site.
 
 Usage:
   python3 rns_digest.py                    Write the digest into the site repo, commit and push
@@ -10,13 +11,13 @@ Usage:
   python3 rns_digest.py --telegram         Also send the digest to Telegram (once per day)
 
 Writes, inside GITHUB_REPO_PATH:
-  <data dir>/rns-today.json    (data dir = parent of GITHUB_COMPANIES_DIR, as for
+  <data dir>/announcements-today.json  (data dir = parent of GITHUB_COMPANIES_DIR, as for
                                 export_companies.py). The site renders it at
-                                /rns/today (page) and /rns/today.txt (posts).
+                                /announcements/today (page) and /announcements/today.txt (posts).
 
-rns-today.json holds the date, the items, and "posts": the ready-to-post blocks
+announcements-today.json holds the date, the items, and "posts": the ready-to-post blocks
 for the X bot, each at most POST_LIMIT characters as X counts them (URLs 23,
-emoji and most symbols 2). /rns/today.txt is the posts joined by a line holding
+emoji and most symbols 2). /announcements/today.txt is the posts joined by a line holding
 only "---". A day with nothing scored DIGEST_MIN_SCORE+ (weekends) writes an
 empty digest for that date, so the bot never reposts a previous day.
 
@@ -40,13 +41,13 @@ from export_companies import (DEFAULT_COMPANIES_DIR, INDEX_FILENAME, commit_and_
 
 DIGEST_TOP = int(os.environ.get("DIGEST_TOP", "5"))
 DIGEST_MIN_SCORE = int(os.environ.get("DIGEST_MIN_SCORE", "7"))
-DIGEST_FILENAME = "rns-today.json"
+DIGEST_FILENAME = "announcements-today.json"
 SENT_DIR = os.path.join("output", "digest")
 
 POST_LIMIT = 280
 POST_DELIMITER = "---"
-TITLE = "Highest-impact UK RNS today 📋"
-FOOTER = "Scored filing history for {n} UK companies → angloedge.com/companies"
+TITLE = "Today's highest-impact UK market announcements 📋"
+FOOTER = "Scored and explained, plus filing history for {n} UK companies → angloedge.com/announcements/today"
 
 
 # ── selection ───────────────────────────────────────────────
@@ -244,7 +245,7 @@ def load_index(index_path):
 
 
 def write_digest(digest, repo_path, digest_rel, branch, dry_run, git=None):
-    """Write rns-today.json if its content changed, then commit and push it."""
+    """Write announcements-today.json if its content changed, then commit and push it."""
     path = os.path.join(repo_path, digest_rel)
     existing = read_text(path)
     if existing is not None:
@@ -260,7 +261,7 @@ def write_digest(digest, repo_path, digest_rel, branch, dry_run, git=None):
     if dry_run:
         log(f"  ℹ {digest_rel}: would be {status} [DRY RUN]")
         return status
-    message = f"rns: digest for {digest['date']} ({len(digest['items'])} announcement(s))"
+    message = f"announcements: digest for {digest['date']} ({len(digest['items'])} announcement(s))"
     kwargs = {"git": git} if git else {}
     commit_and_push(repo_path, branch, [digest_rel], message, **kwargs)
     return status

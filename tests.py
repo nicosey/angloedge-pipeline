@@ -1656,9 +1656,9 @@ class TestRnsDigest(unittest.TestCase):
         from datetime import date
         posts = d.build_posts([self._item("A recommended offer is likely to complete.")], 1722, date(2026, 11, 23))
         self.assertEqual(posts, [
-            "Highest-impact UK RNS today 📋\nMon 23 November 2026",
+            "Today's highest-impact UK market announcements 📋\nMon 23 November 2026",
             "$RBD Reabold Resources — 9/10\nRecommended All Share Offer\nA recommended offer is likely to complete.",
-            "Scored filing history for 1,700+ UK companies → angloedge.com/companies"])
+            "Scored and explained, plus filing history for 1,700+ UK companies → angloedge.com/announcements/today"])
 
     def test_posts_trimmed_to_limit(self):
         import rns_digest as d
@@ -1715,7 +1715,7 @@ class TestRnsDigest(unittest.TestCase):
              patch.object(d.db, "init_db"), patch.object(d.db, "_connect", side_effect=lambda: sqlite3.connect(path)), \
              patch("rns_digest.log"), patch("export_companies.log"):
             rc = d.main(argv, deliver=deliver, git=lambda repo, *a: calls.append(a) or "")
-        out = os.path.join(repo, "src", "data", "rns-today.json")
+        out = os.path.join(repo, "src", "data", "announcements-today.json")
         data = None
         if os.path.exists(out):
             with open(out) as f:
@@ -1728,7 +1728,7 @@ class TestRnsDigest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(data["items"][0]["slug"], "a-aaa")
             self.assertEqual(len(data["posts"]), 3)
-            self.assertIn(("add", "-A", "--", "src/data/rns-today.json"), calls)
+            self.assertIn(("add", "-A", "--", "src/data/announcements-today.json"), calls)
             self.assertTrue(any(c[0] == "push" for c in calls))
             rc, calls2, _ = self._run([], tmp)                     # same content again
             self.assertEqual(calls2, [])
