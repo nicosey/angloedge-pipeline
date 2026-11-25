@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.angloedge-pipeline.digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 rns_digest.py</string>
+    </array>
+
+    <!-- Daily at 16:45 UK time. Runs every day including weekends: quiet days deliberately write an empty digest so the bot never reposts stale content. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>45</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/digest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/digest.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
