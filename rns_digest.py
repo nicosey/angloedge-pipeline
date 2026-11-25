@@ -32,6 +32,8 @@ import sys
 from datetime import date, datetime
 
 import db
+from excluded_accounts import is_excluded
+from routine_filings import routine_type
 from config import log
 from export_companies import (DEFAULT_COMPANIES_DIR, INDEX_FILENAME, commit_and_push,
                               parse_timestamp, read_text, serialise, write_if_changed)
@@ -50,15 +52,19 @@ FOOTER = "Scored filing history for {n} UK companies → angloedge.com/companies
 # ── selection ───────────────────────────────────────────────
 
 def rows_for_day(con, day, min_score):
-    """Enriched rows announced on `day` with score >= min_score, best first."""
+    """Enriched, non-routine rows announced on `day` with score >= min_score, best first.
+    Routine filings (routine_filings.py) never make the digest, whatever their score."""
     cur = con.execute(
-        "SELECT rns_number, timestamp, company_name, ticker, headline, impact_score, insight "
+        "SELECT rns_number, timestamp, company_name, ticker, headline, impact_score, insight, url, category "
         "FROM rns_announcements WHERE impact_score IS NOT NULL AND impact_score >= ?",
         (min_score,))
-    keys = ("rns_number", "timestamp", "company_name", "ticker", "headline", "impact_score", "insight")
+    keys = ("rns_number", "timestamp", "company_name", "ticker", "headline", "impact_score", "insight", "url",
+            "category")
     out = []
     for r in cur.fetchall():
         row = dict(zip(keys, r))
+        if is_excluded(row["ticker"], row["url"]) or routine_type(row["headline"], row["category"]):
+            continue
         ts = parse_timestamp(row["timestamp"])
         if ts is not None and ts.date() == day:
             row["_ts"] = ts

@@ -137,7 +137,7 @@ _PROMPT_BUILDERS = {
 
 # ── public API ───────────────────────────────────────────────
 
-def _ollama_call(prompt, max_tokens=500, model=None):
+def _ollama_call(prompt, max_tokens=500, model=None, timeout=60):
     """Single Ollama call, returns stripped text or None."""
     payload = json.dumps({
         "model": model or OLLAMA_BRIEFING_MODEL,
@@ -149,7 +149,7 @@ def _ollama_call(prompt, max_tokens=500, model=None):
     try:
         req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=payload)
         req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
             return data.get("message", {}).get("content", "").strip() or None
     except Exception as e:
@@ -286,48 +286,62 @@ _MOCK_NARRATIVE = (
 
 # Bump when the enrichment prompt or scoring changes: rows enriched under an
 # older version are re-enriched by enrich_backlog.py (column enrichment_version).
-RNS_PROMPT_VERSION = 2
+RNS_PROMPT_VERSION = 3
+
+# Company history given with each announcement (v3): the company's previous
+# non-routine announcements, as date + headline only — never our own earlier
+# insights or scores, so an error can't feed on itself. db.get_unenriched_rns
+# attaches it as ann["history"] (oldest first).
+HISTORY_MAX_ITEMS = 5
+HISTORY_MAX_DAYS = 365
+HISTORY_HEADLINE_CHARS = 90
 
 _RNS_ENRICH_PROMPT = """\
-You are a careful UK equities analyst. You are given ONLY the company name, ticker,
-category and headline of a regulatory announcement (RNS). You have NOT seen the
-announcement itself and you have no other information about the company.
+You are a careful UK equities analyst writing a short note on a regulatory
+announcement (RNS). You know only what is below: the company, the announcement's
+title and category, and the company's earlier announcements on record.
 
 Company: {company} ({ticker})
 Category: {category}
-Headline: {headline}
+Announcement: {headline}
 
-The category was assigned automatically from the headline's wording and may be wrong;
-judge the headline itself.
+Earlier announcements by this company (oldest first):
+{history}
+
+The category was assigned automatically from the title's wording and may be wrong.
 
 Respond with ONLY a valid JSON object — no explanation, no preamble, no markdown:
 {{
   "impact_score": <integer 1-10>,
-  "insight": "<1-2 sentences on what this announcement means for shareholders>",
+  "insight": "<at most 2 sentences and 40 words on what this means for shareholders>",
   "key_themes": ["<tag1>", "<tag2>"]
 }}
 
 Rules for the insight — follow all of them:
-- Reason only from the company name, category and headline above.
+- Use only the information above. Where the earlier announcements explain this one
+  (an offer followed by a court meeting, then a court sanction), say so, citing them
+  by month.
 - Never name a company, person, product, project, place, amount, percentage or date
-  that does not appear in the headline or the company name.
-- Do not describe what the company does, its sector, history, strategy, finances or
-  recent events unless the headline itself says so. Do not mention competitors,
-  peers, precedents, market conditions or other companies' events.
-- Do not guess the outcome, size, terms or reasons for anything the headline does not state.
-- If the headline alone does not support a specific point, say what this type of
-  announcement generally signifies for shareholders, without inventing specifics.
+  that does not appear above.
+- Do not describe what the company does, its sector, strategy or finances unless the
+  information above says so. Do not mention competitors, peers, precedents, market
+  conditions or other companies' events.
+- Do not guess the outcome, size, terms or reasons for anything not stated above.
+- Write about the announcement, never about its title or wording, and never about
+  what is missing: do not write "the headline", "the title", "does not specify",
+  "not disclosed" or "no details". If there is nothing specific to add, state plainly
+  what this kind of announcement means for shareholders.
 
 key_themes: 1-3 short generic tags (for example "M&A", "Capital raise", "Governance",
-"Results"). No names that are not in the headline.
+"Results"). No names that are not above.
 
 Scoring guide — how much the announcement could matter to the company's shareholders:
 - 9-10: a firm or recommended offer for the company, a transformative merger,
   administration or insolvency, suspension of shares, a severe profit warning
 - 7-8:  a possible offer or formal sale process, a material acquisition or disposal,
   a large fundraise, departure of the CEO or chair, a strategic review, a guidance change
-- 5-6:  scheduled results or a trading update whose direction the headline doesn't
-  state, a contract or partnership described without its size, a board change
+- 5-6:  scheduled results or a trading update with no stated direction, a contract or
+  partnership described without its size, a board change
 - 3-4:  director dealings, a dividend declaration, a results-date notice, meeting
   results, small capital actions
 - 1-2:  administrative housekeeping, and press releases about other organisations or
@@ -361,6 +375,34 @@ def _parse_enrichment_json(text, category=""):
         return None
 
 
+def format_history(history):
+    """Prompt lines for ann["history"]: [{"date": "14 Sep 2026", "headline": ..., "count": n}]."""
+    if not history:
+        return "(none on record)"
+    lines = []
+    for h in history:
+        text = h["headline"]
+        if len(text) > HISTORY_HEADLINE_CHARS:
+            text = text[:HISTORY_HEADLINE_CHARS].rstrip() + "…"
+        times = f" (×{h['count']})" if h.get("count", 1) > 1 else ""
+        lines.append(f"- {h['date']}: {text}{times}")
+    return "\n".join(lines)
+
+
+def build_rns_prompt(ann):
+    """The enrichment prompt for one announcement dict (history optional)."""
+    return _RNS_ENRICH_PROMPT.format(
+        company=ann.get("company_name") or "Unknown",
+        ticker=ann.get("ticker") or "—",
+        category=ann.get("category") or "Other",
+        headline=ann["headline"],
+        history=format_history(ann.get("history")),
+    )
+
+
+ENRICH_TIMEOUT = 180    # seconds; generous so parallel requests queued at Ollama don't time out
+
+
 def enrich_rns_with_llm(announcements, dry_run=False):
     """
     Enrich RNS announcement dicts with LLM-generated impact_score, insight, and key_themes.
@@ -368,18 +410,13 @@ def enrich_rns_with_llm(announcements, dry_run=False):
     """
     results = []
     for ann in announcements:
-        prompt = _RNS_ENRICH_PROMPT.format(
-            company=ann.get("company_name", "Unknown"),
-            ticker=ann.get("ticker", "—"),
-            category=ann.get("category", "Other"),
-            headline=ann["headline"],
-        )
+        prompt = build_rns_prompt(ann)
         if dry_run:
             log(f"  [DRY RUN] Would enrich: {ann['headline'][:70]}")
             continue
 
         log(f"  🔍 {ann['company_name']} ({ann['ticker']}) — {ann['headline'][:55]}...")
-        raw = _ollama_call(prompt, max_tokens=300, model=OLLAMA_ENRICH_MODEL)
+        raw = _ollama_call(prompt, max_tokens=300, model=OLLAMA_ENRICH_MODEL, timeout=ENRICH_TIMEOUT)
         if not raw:
             log("    ⚠ No response, skipping")
             continue

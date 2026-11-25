@@ -13,7 +13,8 @@ announcements the model should judge.
 Precedence: a substantive collector category wins over a routine match, so
 combined headlines like "Placing … and TVR" or "Final Results and TVR" are still
 enriched. The one exception: a Share Buyback row that is really a Transaction in
-Own Shares (daily buyback execution) stays routine.
+Own Shares (daily buyback execution) stays routine, and Third-party Research
+(Kepler, QuotedData, Hardman & Co) is routine whatever the category.
 
 Labels are shown on the site ("12 Holding(s) in Company · 5 Total Voting Rights"),
 so rename with care. Patterns are matched case-insensitively against the stored
@@ -41,12 +42,14 @@ ROUTINE_TYPES = [
     ("Total Voting Rights", _R(r"total\s+voting\s+rights|\btvr\b")),
     ("Form 8 Disclosure", _R(
         r"^\s*(irish\s*)?form\s*-?\s*8\b"
+        r"|\bform\s*8\b(?!\s*-?\s*k\b)"            # anywhere, but not a US Form 8-K
+        r"|opening\s+position\s+disclosure|\(dealing\s+disclosure\)"
         r"|form\s*8\.[35]"
         r"|form\s*8\s*\((dd|opd)\)"
         r"|irish\s+takeover\s+panel"
         r"|_ie_[a-z]+"
         r"|rule\s*2\.(9|10)\b")),          # securities in issue; Rule 2.8 is substantive
-    ("Form 38.5", _R(r"(rule|form)\s*-?\s*38\.5")),
+    ("Form 38.5", _R(r"(rule|forms?)\s*-?\s*38\.5")),
     ("Final Terms", _R(r"final\s+terms|pricing\s+supplement")),
     ("Disclosure Table", _R(r"disclosure\s+table")),
     ("Gearing Disclosure", _R(r"\bgearing\s+(announcement|disclosures?)")),
@@ -73,9 +76,15 @@ ROUTINE_TYPES = [
         r"|^\s*exercise\s+of\s+(share\s+)?(options|warrants)")),
     ("Director Declaration", _R(r"^\s*director\s+declaration")),
     # "Issue of Debt" is deliberately absent: for a small cap it is material.
+    # Programme mechanics (MTN/EMTN programmes, admission particulars, base
+    # prospectuses, offering circulars) are routine: banks, sovereigns, housing
+    # associations and bond SPVs, not news for shareholders.
     ("Debt Notices", _R(
         r"stabilisation\s+notice|early\s+redemption|notice\s+of\s+redemption"
-        r"|notice\s+to\s+(note|bond)holders|supplementary\s+prospectus")),
+        r"|notice\s+to\s+(note|bond)holders|supplementary\s+prospectus"
+        r"|admission\s+particulars|information\s+memorandum|offering\s+circular"
+        r"|medium[\s-]+term\s+notes?|\bemtn\b|\b(note|bond)\s+programme"
+        r"|\bbase\s+prospectus")),
     # Notices only — meeting *results* go to the model (a shareholder revolt is news)
     ("Meeting Notices", _R(
         r"^\s*(notice\s+of\s+(the\s+)?(agm|egm|gm|general\s+meeting|annual\s+general\s+meeting"
@@ -85,7 +94,7 @@ ROUTINE_TYPES = [
         r"compliance\s+with\s+market\s+abuse|closed\s+period|change\s+of\s+registered\s+office"
         r"|cdi\s+monthly\s+movement|report\s+on\s+payments\s+to\s+governments"
         r"|^\s*(notice\s+of\s+)?investor\s+presentation|investor\s+meet\s+company")),
-    ("Third-party Research", _R(r"kepler\s+trust\s+intelligence|\bquoteddata\b")),
+    ("Third-party Research", _R(r"kepler\s+trust\s+intelligence|\bquoteddata\b|\bhardman\s*&\s*co\b")),
 ]
 
 # Collector categories that win over a routine match (the substantive ones).
@@ -96,6 +105,9 @@ SUBSTANTIVE_CATEGORIES = frozenset({
 
 # (category, routine label) pairs where the routine match wins anyway.
 _ROUTINE_WINS = {("Share Buyback", "Transaction in Own Shares")}
+# Labels that win over any category: third-party research about a company's
+# results or deals is still someone else's note, not the company's news.
+_ALWAYS_ROUTINE = {"Third-party Research"}
 
 
 def match_routine(headline):
@@ -109,7 +121,8 @@ def match_routine(headline):
 def routine_type(headline, category=None):
     """Routine label for an announcement, or None if the model should judge it."""
     label = match_routine(headline)
-    if label and category in SUBSTANTIVE_CATEGORIES and (category, label) not in _ROUTINE_WINS:
+    if (label and category in SUBSTANTIVE_CATEGORIES and label not in _ALWAYS_ROUTINE
+            and (category, label) not in _ROUTINE_WINS):
         return None
     return label
 

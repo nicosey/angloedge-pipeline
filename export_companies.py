@@ -15,7 +15,8 @@ Writes, inside GITHUB_REPO_PATH:
 Slugs are permanent: once a ticker has a slug it is reused forever, even if the
 company name changes, so a published URL never moves.
 
-Only our own stored fields are exported (timestamp, category, headline, url and
+Excluded accounts (excluded_accounts.py: newswire and commentary feeds) get no
+page. Only our own stored fields are exported (timestamp, category, headline, url and
 our enrichment). Announcement body text is never stored or exported.
 """
 import json
@@ -29,6 +30,7 @@ from datetime import datetime
 from config import log
 from db import init_db, get_rns_for_export
 from routine_filings import routine_type
+from excluded_accounts import is_excluded
 
 
 MIN_ANNOUNCEMENTS   = 3
@@ -427,6 +429,11 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     if not dry_run and limit is None:
         git(repo_path, "pull", "--rebase", "--autostash", "origin", branch)
 
+    # Newswire / commentary feeds get no company page (excluded_accounts.py);
+    # an existing page is pruned below like any company that no longer qualifies.
+    excluded = [r for r in rows if is_excluded(r.get("ticker"), r.get("url"))]
+    rows = [r for r in rows if not is_excluded(r.get("ticker"), r.get("url"))]
+
     groups, no_ticker, invalid_ts = group_rows(rows)
     for r in invalid_ts[:MAX_TIMESTAMP_WARNINGS]:
         log(f"  ⚠ Unparseable timestamp {r['timestamp']!r} — {r['ticker']} rns {r['rns_number']} (sorted last)")
@@ -473,6 +480,7 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
         "pruned":            0,
         "below_min":         below_min,
         "debt_programme":    len(debt_issuers),
+        "excluded_rows":     len(excluded),
         "no_ticker_rows":    no_ticker,
         "invalid_timestamps": len(invalid_ts),
         "index_status":      "skipped",
@@ -539,6 +547,7 @@ def log_summary(s, dry_run):
     log(f"   Files pruned:                {s['pruned']}")
     log(f"   Skipped (< {MIN_ANNOUNCEMENTS} announcements): {s['below_min']} companies")
     log(f"   Skipped (debt programme):    {s['debt_programme']} issuers")
+    log(f"   Skipped (excluded accounts): {s.get('excluded_rows', 0)} announcements")
     log(f"   Skipped (no ticker):         {s['no_ticker_rows']} announcements")
     log(f"   Unparseable timestamps:      {s['invalid_timestamps']}")
 

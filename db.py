@@ -5,7 +5,8 @@ from datetime import datetime
 
 from config import DB_PATH, ARCHIVE_DB_PATH, TELEGRAM_MIN_SCORE, log
 from routine_filings import routine_type, SUBSTANTIVE_CATEGORIES
-from ai import RNS_PROMPT_VERSION
+from ai import RNS_PROMPT_VERSION, HISTORY_MAX_ITEMS, HISTORY_MAX_DAYS
+from excluded_accounts import excluded_sql
 
 
 DB_TIMEOUT = 30  # seconds to wait before raising "locked" error
@@ -138,6 +139,8 @@ def init_db():
                 con.execute(f"ALTER TABLE rns_announcements {col_def}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # company_history() looks up each enriched row's company by ticker
+        con.execute("CREATE INDEX IF NOT EXISTS idx_rns_ticker ON rns_announcements(ticker)")
         con.commit()
         con.close()
     _db_op(_)
@@ -461,15 +464,93 @@ def save_rns_announcements(announcements):
 def _connect_with_routine():
     con = _connect()
     con.create_function("routine_type", 2, routine_type, deterministic=True)
+    con.create_function("excluded_account", 2, excluded_sql, deterministic=True)
     return con
 
 
-# Rows needing enrichment. The second clause (include_stale) adds rows enriched
-# under an older prompt version, routine or not, so their insight is replaced.
+# Rows needing enrichment. The second clause (include_stale) adds non-routine rows
+# enriched under an older prompt version, so their insight is replaced. Rows that
+# became routine after being enriched keep what they have and are not re-sent.
+# Excluded accounts (excluded_accounts.py: newswire and commentary feeds) are
+# never enriched, re-enriched or posted.
 ENRICH_WORK_SQL = (
-    "(impact_score IS NULL AND routine_type(headline, category) IS NULL)")
+    "(impact_score IS NULL AND routine_type(headline, category) IS NULL "
+    "AND excluded_account(ticker, url) = 0)")
 STALE_ENRICHMENT_SQL = (
-    "(impact_score IS NOT NULL AND COALESCE(enrichment_version, 1) < ?)")
+    "(impact_score IS NOT NULL AND COALESCE(enrichment_version, 1) < ? "
+    "AND routine_type(headline, category) IS NULL AND excluded_account(ticker, url) = 0)")
+
+
+# Enriched rows that a later routine_filings pattern now classes as routine. They
+# are never re-enriched, so without clearing they would keep an old insight and
+# score (and show in full on the site) while every other filing of that type is
+# grouped as routine.
+ROUTINE_ENRICHED_SQL = (
+    "(impact_score IS NOT NULL AND routine_type(headline, category) IS NOT NULL)")
+
+
+def clear_routine_enrichment(dry_run=False):
+    """Clear the enrichment (score, insight, themes, version) on rows that are now
+    routine. Returns the number of rows affected (or that would be)."""
+    def _():
+        con = _connect_with_routine()
+        try:
+            if dry_run:
+                return con.execute(
+                    f"SELECT COUNT(*) FROM rns_announcements WHERE {ROUTINE_ENRICHED_SQL}").fetchone()[0]
+            cur = con.execute(
+                "UPDATE rns_announcements SET impact_score=NULL, insight=NULL, key_themes=NULL, "
+                f"enriched_at=NULL, enrichment_version=NULL WHERE {ROUTINE_ENRICHED_SQL}")
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+    return _db_op(_)
+
+
+def company_history(con, ticker, before_ts, rns_number=None,
+                    max_items=HISTORY_MAX_ITEMS, max_days=HISTORY_MAX_DAYS, cache=None):
+    """
+    The company's previous non-routine announcements, for the enrichment prompt:
+    up to max_items within max_days before `before_ts`, oldest first, as
+    [{"date": "14 Sep 2026", "headline": ..., "count": n}] with identical
+    consecutive headlines collapsed. Date and headline only — never our own
+    earlier insight or score.
+    """
+    from datetime import timedelta
+    from export_companies import parse_timestamp
+    current = parse_timestamp(before_ts)
+    if not ticker or current is None:
+        return []
+    rows = cache.get(ticker) if cache is not None else None
+    if rows is None:
+        rows = []
+        for n, ts, headline, category, url in con.execute(
+                "SELECT rns_number, timestamp, headline, category, url FROM rns_announcements "
+                "WHERE ticker = ?", (ticker,)):
+            t = parse_timestamp(ts)
+            if t is None or not headline or routine_type(headline, category) or excluded_sql(ticker, url):
+                continue
+            rows.append((t, n, headline.strip()))
+        rows.sort(reverse=True)                                  # newest first
+        if cache is not None:
+            cache[ticker] = rows
+    floor = current - timedelta(days=max_days)
+    picked = []                                                  # newest first, collapsed
+    for t, n, headline in rows:
+        if n == rns_number or t >= current:
+            continue
+        if t < floor:
+            break
+        if picked and picked[-1]["headline"].casefold() == headline.casefold():
+            picked[-1]["count"] += 1
+            picked[-1]["t"] = t
+            continue
+        if len(picked) == max_items:
+            break
+        picked.append({"t": t, "headline": headline, "count": 1})
+    return [{"date": f"{p['t'].day} {p['t']:%b %Y}", "headline": p["headline"], "count": p["count"]}
+            for p in reversed(picked)]
 
 
 def get_unenriched_rns(limit=50, skip=frozenset(), include_stale=False):
@@ -494,9 +575,9 @@ def get_unenriched_rns(limit=50, skip=frozenset(), include_stale=False):
             "ORDER BY timestamp DESC LIMIT ?",
             (*args, limit + len(skip)),
         ).fetchall()
-        con.close()
         rows = [r for r in rows if r[0] not in skip][:limit]
-        return [
+        cache = {}
+        out = [
             {
                 "rns_number":   r[0],
                 "timestamp":    r[1],
@@ -505,9 +586,12 @@ def get_unenriched_rns(limit=50, skip=frozenset(), include_stale=False):
                 "headline":     r[4],
                 "url":          r[5],
                 "category":     r[6] or PROMPT_CATEGORY_FOR_BLANK,
+                "history":      company_history(con, r[3], r[1], r[0], cache=cache),
             }
             for r in rows
         ]
+        con.close()
+        return out
     return _db_op(_)
 
 
@@ -518,12 +602,13 @@ def get_unpublished_enriched_rns(min_score=None):
     """
     min_score = TELEGRAM_MIN_SCORE if min_score is None else min_score
     def _():
-        con = _connect()
+        con = _connect_with_routine()
         rows = con.execute(
             "SELECT rns_number, timestamp, company_name, ticker, headline, url, "
             "       category, impact_score, insight, key_themes "
             "FROM rns_announcements "
             "WHERE impact_score IS NOT NULL AND telegram_published_at IS NULL "
+            "  AND excluded_account(ticker, url) = 0 "
             "  AND impact_score >= ? "
             "ORDER BY impact_score DESC, timestamp DESC",
             (min_score,),

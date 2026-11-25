@@ -10,10 +10,18 @@ Usage:
   python3 enrich_backlog.py --limit N    Enrich at most N rows (the Telegram guard still covers
                                          the whole backlog)
   python3 enrich_backlog.py --force      Run inside the RNS collector's window (testing only)
+  python3 enrich_backlog.py --workers N  Concurrent model calls (default ENRICH_WORKERS, 1). Needs
+                                         Ollama started with OLLAMA_NUM_PARALLEL >= N; measure first
+                                         with: python3 enrich_diagnostics.py --throughput
+  python3 enrich_backlog.py --clear-routine [--dry-run]
+                                         Only clear the enrichment on rows that a newer
+                                         routine_filings pattern now classes as routine (any time
+                                         of day; every full run also does this first)
 
 Selection and enrichment are the live path: db.get_unenriched_rns with
-include_stale=True (routine filings excluded unless they already carry an
-old-version enrichment), ai.enrich_rns_with_llm and db.update_rns_enrichment,
+include_stale=True (routine filings and excluded accounts never sent; rows that
+became routine after enrichment keep what they have), ai.enrich_rns_with_llm
+(with each company's earlier announcements as context) and db.update_rns_enrichment,
 which stamps the current version. Newest first. A re-enriched row keeps its old
 enrichment until the new one is saved, so a failed call loses nothing.
 
@@ -28,9 +36,11 @@ at most the call in progress. Rows that fail are not retried within a run.
 Like recover_headlines.py, it refuses to start during the collector's
 07:00–16:30 window and stops cleanly before it opens.
 """
+import os
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import ai
@@ -42,11 +52,13 @@ from recover_headlines import in_collector_window, QUIET_START, QUIET_END
 GUARD_AGE_HOURS = 24
 BATCH_SIZE = 10
 MAX_CONSECUTIVE_FAILURES = 20     # model down or unparseable output: stop
+ENRICH_WORKERS = int(os.environ.get("ENRICH_WORKERS", "1"))
 
 
 def eligible_rows(con):
     """Rows to (re-)enrich: rns_number, timestamp, category, telegram_published_at, stale."""
     con.create_function("routine_type", 2, db.routine_type, deterministic=True)
+    con.create_function("excluded_account", 2, db.excluded_sql, deterministic=True)
     cur = con.execute(
         "SELECT rns_number, timestamp, category, telegram_published_at, "
         "       impact_score IS NOT NULL FROM rns_announcements "
@@ -79,11 +91,32 @@ def apply_guard(con, rns_numbers, run_time):
             [(run_time, n) for n in rns_numbers])
 
 
-def enrich(limit=None, force=False, now=datetime.now, get=None, enrich_fn=None, save=None):
+def _run_batch(batch, enrich_fn, pool):
+    """{rns_number: enrichment} for a batch: one model call per row, `pool` workers at a time.
+    Only model calls run in worker threads; every DB read and write stays on this thread."""
+    if pool is None:
+        return dict(enrich_fn(batch))
+    out = {}
+    for pairs in pool.map(lambda ann: enrich_fn([ann]), batch):
+        out.update(dict(pairs))
+    return out
+
+
+def enrich(limit=None, force=False, now=datetime.now, get=None, enrich_fn=None, save=None, workers=1):
     """Enrich newest-first in batches; returns a Counter of outcomes."""
     get = get or _get_work
     enrich_fn = enrich_fn or ai.enrich_rns_with_llm
     save = save or db.update_rns_enrichment
+    batch_size = max(BATCH_SIZE, workers * 4)
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        return _enrich_loop(limit, force, now, get, enrich_fn, save, batch_size, pool)
+    finally:
+        if pool:
+            pool.shutdown(wait=True)
+
+
+def _enrich_loop(limit, force, now, get, enrich_fn, save, batch_size, pool):
     counts, failed, consecutive = Counter(), set(), 0
     started = time.monotonic()
     while limit is None or counts["enriched"] + counts["failed"] < limit:
@@ -92,11 +125,11 @@ def enrich(limit=None, force=False, now=datetime.now, get=None, enrich_fn=None, 
                 f"Progress is saved — re-run after {QUIET_END:%H:%M} to continue.")
             counts["stopped_for_window"] = 1
             break
-        size = BATCH_SIZE if limit is None else min(BATCH_SIZE, limit - counts["enriched"] - counts["failed"])
+        size = batch_size if limit is None else min(batch_size, limit - counts["enriched"] - counts["failed"])
         batch = get(limit=size, skip=frozenset(failed))
         if not batch:
             break
-        results = dict(enrich_fn(batch))
+        results = _run_batch(batch, enrich_fn, pool)
         for ann in batch:
             e = results.get(ann["rns_number"])
             if e:
@@ -120,7 +153,20 @@ def enrich(limit=None, force=False, now=datetime.now, get=None, enrich_fn=None, 
 
 def main(argv):
     dry_run, force = "--dry-run" in argv, "--force" in argv
-    limit = None
+    if "--clear-routine" in argv:
+        # One quick transaction, safe at any time of day; no model calls.
+        db.init_db()
+        n = db.clear_routine_enrichment(dry_run=dry_run)
+        log(f"🧹 Enriched rows now routine: {n} " + ("would be cleared (dry run)" if dry_run else "cleared"))
+        return 0
+    limit, workers = None, ENRICH_WORKERS
+    if "--workers" in argv:
+        try:
+            workers = int(argv[argv.index("--workers") + 1])
+        except (IndexError, ValueError):
+            raise SystemExit("--workers needs a positive integer")
+    if workers < 1:
+        raise SystemExit("--workers needs a positive integer")
     if "--limit" in argv:
         try:
             limit = int(argv[argv.index("--limit") + 1])
@@ -134,6 +180,8 @@ def main(argv):
         return 1
 
     db.init_db()
+    n = db.clear_routine_enrichment(dry_run=dry_run)
+    log(f"🧹 Enriched rows now routine: {n} " + ("would be cleared" if dry_run else "cleared"))
     con = db._connect()
     try:
         rows = eligible_rows(con)
@@ -155,7 +203,8 @@ def main(argv):
     finally:
         con.close()
 
-    counts = enrich(limit=limit, force=force)
+    log(f"⚙️  {workers} worker(s)")
+    counts = enrich(limit=limit, force=force, workers=workers)
     log("")
     log(f"Enriched: {counts['enriched']}")
     log(f"Failed:   {counts['failed']}  (left unenriched; retried on the next run)")

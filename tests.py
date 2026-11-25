@@ -1494,15 +1494,18 @@ class TestPromptV2(unittest.TestCase):
     def test_prompt_forbids_outside_facts(self):
         import ai
         p = ai._RNS_ENRICH_PROMPT
-        self.assertGreaterEqual(ai.RNS_PROMPT_VERSION, 2)
-        for phrase in ("Reason only from the company name, category and headline",
+        self.assertGreaterEqual(ai.RNS_PROMPT_VERSION, 3)
+        for phrase in ("Use only the information above",
                        "Never name a company, person, product, project, place, amount, percentage or date",
-                       "generally signifies for shareholders, without inventing specifics"):
+                       'do not write "the headline"', "at most 2 sentences and 40 words"):
             self.assertIn(phrase, p)
-        for gone in ("precedent", "sector trends", "Never generic"):
-            self.assertNotIn(gone, p.replace("peers, precedents", ""))
-        filled = p.format(company="Acme", ticker="ACM", category="Other", headline="Offer")
-        self.assertIn("Headline: Offer", filled)
+        for gone in ("sector trends", "Never generic", "Reason only from the company name"):
+            self.assertNotIn(gone, p)
+        filled = ai.build_rns_prompt({"company_name": "Acme", "ticker": "ACM", "category": None,
+                                      "headline": "Offer"})
+        self.assertIn("Announcement: Offer", filled)
+        self.assertIn("Category: Other", filled)
+        self.assertIn("(none on record)", filled)
 
     def test_no_score_floor(self):
         import ai
@@ -1545,7 +1548,7 @@ class TestPromptV2(unittest.TestCase):
                 backlog = db.get_unenriched_rns(limit=50, include_stale=True)
                 skipped = db.get_unenriched_rns(limit=50, include_stale=True, skip=frozenset({"3"}))
         self.assertEqual([r["rns_number"] for r in live], ["1"])
-        self.assertEqual([r["rns_number"] for r in backlog], ["3", "2", "1"])    # newest first
+        self.assertEqual([r["rns_number"] for r in backlog], ["2", "1"])    # routine "3" keeps its v1 text
         self.assertEqual([r["rns_number"] for r in skipped], ["2", "1"])
 
     def test_backlog_counts_stale_and_guards_them(self):
@@ -1558,8 +1561,8 @@ class TestPromptV2(unittest.TestCase):
                 guard = eb.rows_to_guard(rows, datetime(2026, 11, 24, 17, 0))
                 con.close()
         self.assertEqual({r["rns_number"]: bool(r["stale"]) for r in rows},
-                         {"1": False, "2": True, "3": True})
-        self.assertEqual(sorted(guard), ["1", "2", "3"])
+                         {"1": False, "2": True})
+        self.assertEqual(sorted(guard), ["1", "2"])
 
     def test_reenrichment_replaces_and_stamps(self):
         import db, ai, enrich_backlog as eb
@@ -1574,10 +1577,10 @@ class TestPromptV2(unittest.TestCase):
                 rows = con.execute("SELECT rns_number, insight, enrichment_version FROM rns_announcements "
                                    "ORDER BY rns_number").fetchall()
                 con.close()
-        self.assertEqual(counts["enriched"], 3)
+        self.assertEqual(counts["enriched"], 2)
         self.assertEqual(left, [])
         self.assertEqual(rows, [("1", "v2", ai.RNS_PROMPT_VERSION), ("2", "v2", ai.RNS_PROMPT_VERSION),
-                                ("3", "v2", ai.RNS_PROMPT_VERSION), ("4", None, None),
+                                ("3", "old", 1), ("4", None, None),
                                 ("5", "new", ai.RNS_PROMPT_VERSION)])
 
 
@@ -1586,8 +1589,10 @@ class TestRnsDigest(unittest.TestCase):
         import sqlite3
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE rns_announcements (rns_number, timestamp, company_name, ticker, "
-                    "headline, impact_score, insight)")
-        con.executemany("INSERT INTO rns_announcements VALUES (?,?,?,?,?,?,?)", rows)
+                    "headline, impact_score, insight, url, category)")
+        con.executemany("INSERT INTO rns_announcements (rns_number, timestamp, company_name, ticker, "
+                        "headline, impact_score, insight, url) VALUES (?,?,?,?,?,?,?,?)",
+                        [r if len(r) == 8 else (*r, None) for r in rows])
         con.commit()
         return con
 
@@ -1797,6 +1802,252 @@ class TestOutsideTerms(unittest.TestCase):
                          ["Sierra Leone"])
         self.assertEqual(o("Securing $7m of orders.", "Concurrent $7m Production Orders"), [])
         self.assertEqual(o("A formal sale process means the board seeks offers.", "Futura Formal Sale Process"), [])
+
+
+# ── v3: excluded accounts, debt routine, history, parallel ───
+
+def _seed_full(rows):
+    """rows: dicts with rns_number, timestamp, ticker, headline and optional company_name, url, category."""
+    import db
+    db.init_db()
+    db.save_rns_announcements([{
+        "company_name": r.get("company_name", r["ticker"] or "X"), "url": r.get("url", "u" + r["rns_number"]),
+        "category": r.get("category", ""), **r} for r in rows])
+
+
+class TestExcludedAccounts(unittest.TestCase):
+    def test_by_ticker_and_wire(self):
+        from excluded_accounts import is_excluded
+        self.assertTrue(is_excluded("FNEWS"))
+        self.assertTrue(is_excluded("fros.ukn"))
+        self.assertTrue(is_excluded("NEWCO", "https://www.investegate.co.uk/announcement/fnw/newco--x/y/1"))
+        self.assertFalse(is_excluded("DCC", "https://www.investegate.co.uk/announcement/rns/dcc--dcc/y/1"))
+        self.assertFalse(is_excluded("WAD", "https://www.investegate.co.uk/announcement/ukn/wadworth--wad/y/1"))
+        self.assertFalse(is_excluded(None, None))
+
+    def _db_rows(self):
+        return [
+            {"rns_number": "1", "timestamp": "2026-11-20T09:00:00", "ticker": "FNEWS", "headline": "Crypto exchange news"},
+            {"rns_number": "2", "timestamp": "2026-11-20T10:00:00", "ticker": "NEWCO", "headline": "Wire item",
+             "url": "https://www.investegate.co.uk/announcement/fnw/newco--x/y/2"},
+            {"rns_number": "3", "timestamp": "2026-11-20T11:00:00", "ticker": "ACM", "headline": "Strategic review"},
+        ]
+
+    def test_never_enriched_reenriched_or_posted(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_full(self._db_rows())
+                self.assertEqual([r["rns_number"] for r in db.get_unenriched_rns(limit=50)], ["3"])
+                for n in ("1", "2", "3"):
+                    db.update_rns_enrichment(n, 9, "x", [], version=1)
+                self.assertEqual([r["rns_number"] for r in db.get_unenriched_rns(limit=50, include_stale=True)], ["3"])
+                self.assertEqual([r["rns_number"] for r in db.get_unpublished_enriched_rns(min_score=1)], ["3"])
+
+    def test_export_gives_no_page_and_prunes_existing(self):
+        from export_companies import export_companies
+        with tempfile.TemporaryDirectory() as repo:
+            rows = [_rns_row(i, "FNEWS", f"2026-05-0{i}T09:00:00", name="FinanceWire News") for i in range(1, 4)]
+            rows += [_rns_row(i, "ACM", f"2026-05-0{i}T09:00:00") for i in range(4, 7)]
+            d = os.path.join(repo, "src", "data", "companies")
+            os.makedirs(d)
+            with open(os.path.join(d, "financewire-news-fnews.json"), "w") as f:
+                json.dump({"ticker": "FNEWS", "slug": "financewire-news-fnews"}, f)
+            with patch("export_companies.log"):
+                s = export_companies(rows, repo, os.path.join("src", "data", "companies"), git=MagicMock())
+            self.assertEqual(sorted(os.listdir(d)), ["acme-acm.json"])
+            self.assertEqual((s["excluded_rows"], s["pruned"]), (3, 1))
+
+    def test_digest_skips_excluded(self):
+        import rns_digest as d, sqlite3
+        from datetime import date
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE rns_announcements (rns_number, timestamp, company_name, ticker, headline, "
+                    "impact_score, insight, url, category)")
+        con.executemany("INSERT INTO rns_announcements (rns_number, timestamp, company_name, ticker, headline, "
+                        "impact_score, insight, url) VALUES (?,?,?,?,?,?,?,?)", [
+            ("1", "2026-11-23T08:00:00", "FinanceWire News", "FNEWS", "Raise", 9, "x", None),
+            ("2", "2026-11-23T09:00:00", "Acme", "ACM", "Offer", 8, "x", None),
+            ("3", "2026-11-23T10:00:00", "HFC", "HFC", "£5,000,000,000 Secured Euro Medium Term Note", 8, "x", None)])
+        self.assertEqual([r["rns_number"] for r in d.rows_for_day(con, date(2026, 11, 23), 7)], ["2"])
+
+
+class TestClearRoutineEnrichment(unittest.TestCase):
+    def test_clears_only_routine_enriched_rows(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_full([
+                    {"rns_number": "1", "timestamp": "2026-11-20T09:00:00", "ticker": "BAH",
+                     "headline": "Publication of Offering Circular"},
+                    {"rns_number": "2", "timestamp": "2026-11-20T10:00:00", "ticker": "ACM",
+                     "headline": "Strategic review"},
+                ])
+                db.update_rns_enrichment("1", 9, "x", ["a"], version=2)
+                db.update_rns_enrichment("2", 7, "y", ["b"], version=2)
+                self.assertEqual(db.clear_routine_enrichment(dry_run=True), 1)
+                self.assertEqual(db.clear_routine_enrichment(), 1)
+                self.assertEqual(db.clear_routine_enrichment(), 0)
+                con = db._connect()
+                got = dict((r[0], r[1:]) for r in con.execute(
+                    "SELECT rns_number, impact_score, insight, key_themes, enriched_at, enrichment_version "
+                    "FROM rns_announcements"))
+                con.close()
+                self.assertEqual(got["1"], (None, None, None, None, None))
+                self.assertEqual(got["2"][:2], (7, "y"))
+                self.assertEqual(db.get_unenriched_rns(limit=50), [])
+
+
+class TestDebtProgrammeRoutine(unittest.TestCase):
+    def test_programme_mechanics_routine(self):
+        from routine_filings import routine_type as rt
+        for h in ("Publication of supplementary admission particulars",
+                  "Publication of Programme Admission Particulars",
+                  "£5,000,000,000 Secured Euro Medium Term Note",
+                  "FAB EMTN Series 200 - USD500m FXD due 2031",
+                  "Publication of a Supplementary Base Prospectus",
+                  "Update of Global Covered Bond Programme",
+                  "Publication of Information Memorandum",
+                  "Publication of Offering Circular"):
+            self.assertEqual(rt(h), "Debt Notices", h)
+
+    def test_debt_raising_still_judged(self):
+        from routine_filings import routine_type as rt
+        for h in ("Issue of Debt", "Bond issue to fund expansion", "Publication of a Prospectus",
+                  "£20m Convertible Loan Note Facility"):
+            self.assertIsNone(rt(h), h)
+
+    def test_takeover_disclosure_forms(self):
+        from routine_filings import routine_type as rt
+        self.assertEqual(rt("Berry Street Form 8 (Opening Position Disclosure)"), "Form 8 Disclosure")
+        self.assertEqual(rt("Opening Position Disclosure - SThree Plc"), "Form 8 Disclosure")
+        self.assertEqual(rt("DCC Energy PLC (Dealing Disclosure) - 09032026"), "Form 8 Disclosure")
+        self.assertEqual(rt("Forms 38.5a - DCC ENERGY PLC"), "Form 38.5")
+        self.assertIsNone(rt("IPC Files Current Report on Form 8-K"))
+
+    def test_third_party_research_wins_over_category(self):
+        from routine_filings import routine_type as rt
+        self.assertEqual(rt("Hardman & Co Research - FY’26 results: look to future realisations", "Results"),
+                         "Third-party Research")
+        self.assertEqual(rt("Hardman & Co Research: Fourth acquisition in two years", "Acquisition"),
+                         "Third-party Research")
+        self.assertIsNone(rt("Result of Placing and TVR", "Placing"))      # normal precedence intact
+
+
+class TestCompanyHistory(unittest.TestCase):
+    ROWS = [
+        ("1", "2025-06-01T09:00:00", "Too old: possible offer"),
+        ("2", "2026-09-10T07:00:00", "Recommended Cash Offer"),
+        ("3", "2026-09-15T07:00:00", "Transaction in Own Shares"),          # routine: left out
+        ("4", "2026-10-01T07:00:00", "Director/PDMR Shareholding"),
+        ("5", "2026-10-02T07:00:00", "Director/PDMR Shareholding"),
+        ("6", "2026-10-20T07:00:00", "Result of Court Meeting"),
+        ("7", "2026-11-23T07:00:00", "Court Sanction of the Scheme"),        # the row itself
+        ("8", "2026-11-24T07:00:00", "Later news"),                          # after: left out
+    ]
+
+    def _history(self, **kw):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_full([{"rns_number": n, "timestamp": t, "ticker": "ELCO", "headline": h} for n, t, h in self.ROWS]
+                           + [{"rns_number": "9", "timestamp": "2026-11-01T07:00:00", "ticker": "OTHER",
+                               "headline": "Other company"}])
+                con = db._connect()
+                out = db.company_history(con, "ELCO", "2026-11-23T07:00:00", "7", **kw)
+                con.close()
+        return out
+
+    def test_previous_non_routine_oldest_first_collapsed(self):
+        self.assertEqual(self._history(), [
+            {"date": "10 Sep 2026", "headline": "Recommended Cash Offer", "count": 1},
+            {"date": "1 Oct 2026", "headline": "Director/PDMR Shareholding", "count": 2},
+            {"date": "20 Oct 2026", "headline": "Result of Court Meeting", "count": 1},
+        ])
+
+    def test_max_items_keeps_most_recent(self):
+        self.assertEqual([h["headline"] for h in self._history(max_items=2)],
+                         ["Director/PDMR Shareholding", "Result of Court Meeting"])
+
+    def test_no_ticker_or_bad_timestamp(self):
+        import db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                db.init_db()
+                con = db._connect()
+                self.assertEqual(db.company_history(con, "", "2026-11-23T07:00:00"), [])
+                self.assertEqual(db.company_history(con, "ELCO", "garbage"), [])
+                con.close()
+
+    def test_selection_attaches_history_and_prompt_shows_it(self):
+        import db, ai
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_full([{"rns_number": n, "timestamp": t, "ticker": "ELCO", "headline": h} for n, t, h in self.ROWS])
+                for n in ("1", "2", "4", "5", "6", "8"):
+                    db.update_rns_enrichment(n, 5, "x", [])
+                rows = db.get_unenriched_rns(limit=5)
+        self.assertEqual([r["rns_number"] for r in rows], ["7"])
+        prompt = ai.build_rns_prompt(rows[0])
+        self.assertIn("- 10 Sep 2026: Recommended Cash Offer\n- 1 Oct 2026: Director/PDMR Shareholding (×2)\n"
+                      "- 20 Oct 2026: Result of Court Meeting", prompt)
+        self.assertNotIn("Later news", prompt)
+
+    def test_history_headline_trimmed(self):
+        import ai
+        out = ai.format_history([{"date": "1 Oct 2026", "headline": "x" * 200, "count": 1}])
+        self.assertEqual(len(out), len("- 1 Oct 2026: ") + ai.HISTORY_HEADLINE_CHARS + 1)
+
+
+class TestParallelEnrich(unittest.TestCase):
+    def test_workers_give_same_result_and_save_on_main_thread(self):
+        import threading, enrich_backlog as eb
+        rows = [{"rns_number": str(i), "headline": f"h{i}"} for i in range(30)]
+        def make_get():
+            done = set()
+            def get(limit, skip):
+                out = [r for r in rows if r["rns_number"] not in done and r["rns_number"] not in skip][:limit]
+                return out
+            return get, done
+        call_threads = set()
+        def fake_enrich(batch):
+            call_threads.add(threading.get_ident())
+            return [(a["rns_number"], {"impact_score": 1 + int(a["rns_number"]) % 9, "insight": "i",
+                                       "key_themes": []}) for a in batch if a["rns_number"] != "7"]
+        results = {}
+        for workers in (1, 4):
+            get, done = make_get()
+            saved, save_threads = {}, set()
+            def save(n, score, insight, themes):
+                save_threads.add(threading.get_ident()); saved[n] = score; done.add(n)
+            with patch("enrich_backlog.log"):
+                counts = eb.enrich(force=True, get=get, enrich_fn=fake_enrich, save=save, workers=workers)
+            results[workers] = (saved, counts["enriched"], counts["failed"])
+            self.assertEqual(save_threads, {threading.get_ident()})
+        self.assertEqual(results[1], results[4])
+        self.assertEqual(results[4][1:], (29, 1))
+        self.assertGreater(len(call_threads), 1)
+
+    def test_workers_flag(self):
+        import enrich_backlog as eb
+        with self.assertRaises(SystemExit):
+            eb.main(["--workers", "0", "--dry-run"])
+
+
+class TestThroughput(unittest.TestCase):
+    def test_measures_each_concurrency(self):
+        import db, enrich_diagnostics as d
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("db.DB_PATH", os.path.join(tmpdir, "t.db")), patch("db.log"):
+                _seed_full([{"rns_number": str(i), "timestamp": f"2026-11-2{i}T09:00:00", "ticker": "ACM",
+                             "headline": f"News {i}"} for i in range(4)])
+                con = db._connect()
+                calls = []
+                with patch("enrich_diagnostics.log"):
+                    out = d.throughput(con, [1, 2], 4, call=lambda p: calls.append(p) or "{}")
+                con.close()
+        self.assertEqual(sorted(out), [1, 2])
+        self.assertEqual(len(calls), 1 + 4 * 2)            # warm-up + each prompt per setting
 
 
 class TestGitHubConnection(unittest.TestCase):
