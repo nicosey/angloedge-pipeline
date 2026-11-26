@@ -244,8 +244,15 @@ def load_index(index_path):
     return {c["ticker"]: c["slug"] for c in index if c.get("ticker") and c.get("slug")}, len(index)
 
 
-def write_digest(digest, repo_path, digest_rel, branch, dry_run, git=None):
-    """Write announcements-today.json if its content changed, then commit and push it."""
+def write_digest(digest, repo_path, digest_rel, branch, dry_run, git=None, generated=None):
+    """Write announcements-today.json if its content changed, then commit and push it.
+    The clone is repaired and synced with origin first (site_repo), so the
+    comparison is against origin's copy and a stuck rebase can't swallow the write."""
+    import site_repo
+    generated = generated if generated is not None else [digest_rel]
+    if not dry_run:
+        site_repo.recover(repo_path, generated, git)
+        site_repo.sync(repo_path, branch, generated, git)
     path = os.path.join(repo_path, digest_rel)
     existing = read_text(path)
     if existing is not None:
@@ -263,7 +270,7 @@ def write_digest(digest, repo_path, digest_rel, branch, dry_run, git=None):
         return status
     message = f"announcements: digest for {digest['date']} ({len(digest['items'])} announcement(s))"
     kwargs = {"git": git} if git else {}
-    commit_and_push(repo_path, branch, [digest_rel], message, **kwargs)
+    commit_and_push(repo_path, branch, [digest_rel], message, generated=generated, **kwargs)
     return status
 
 
@@ -322,6 +329,22 @@ def main(argv, deliver=None, git=None):
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         log("❌ GITHUB_REPO_PATH must point at the site repo")
         return 1
+    import alerts
+    try:
+        rc = _run(opts, repo_path, companies_rel, branch, deliver, git)
+    except Exception as e:       # any failure: the site would silently go stale
+        log(f"❌ Digest publish failed: {e}")
+        if not opts["dry_run"]:
+            alerts.failure("digest", f"Digest publish failed: {e}")
+        return 1
+    if not opts["dry_run"]:
+        alerts.resolved("digest")
+    return rc
+
+
+def _run(opts, repo_path, companies_rel, branch, deliver, git):
+    import site_repo
+    day = opts["day"]
     paths = site_paths(repo_path, companies_rel)
     slugs, count = load_index(paths["index"])
 
@@ -339,11 +362,8 @@ def main(argv, deliver=None, git=None):
     log(f"📋 Digest for {day}: {len(digest['items'])} announcement(s) scored {opts['min_score']}+")
     for p in digest["posts"]:
         log(f"\n[{x_length(p)}/{POST_LIMIT}]\n{p}")
-    try:
-        write_digest(digest, repo_path, paths["digest_rel"], branch, opts["dry_run"], git=git)
-    except RuntimeError as e:
-        log(f"❌ Digest publish failed: {e}")
-        return 1
+    write_digest(digest, repo_path, paths["digest_rel"], branch, opts["dry_run"], git=git,
+                 generated=site_repo.generated_paths(companies_rel))
     if opts["telegram"] and not opts["dry_run"]:
         if not send_telegram(digest, day, deliver):
             return 1

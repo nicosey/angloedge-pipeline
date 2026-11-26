@@ -353,7 +353,30 @@ Results are stored in `output/briefings.db` (SQLite — no server required):
 
 | Job | Schedule | Command |
 | --- | --- | --- |
-| `com.angloedge.robotics` | 6pm daily | `briefing.py robotics && publish.py` |
+| `com.angloedge.robotics` | 6pm daily | `briefing.py robotics && site_repo.py --repair && publish.py` |
+
+### Site repo health and alerts
+
+| Job | Schedule | Command |
+| --- | --- | --- |
+| `com.angloedge-pipeline.sitecheck` | 6pm weekdays | `site_repo.py --check` |
+
+The export and digest both push generated data into the site repo. `site_repo.py`
+clears a stuck rebase or merge whose conflicts are only in generated files
+(company pages, the companies index, `announcements-today.json`) and alerts on
+anything else. `run.sh` and the robotics job run `site_repo.py --repair` before
+`publish.py`. `--check` also alerts if no export or digest commit has reached
+origin in 30 hours.
+
+Alerts go to a private Telegram chat. Set `TELEGRAM_CHAT_ID_ALERTS` in `.env`
+(your own chat with the bot, not the public channel). `TELEGRAM_BOT_TOKEN_ALERTS`
+is optional and defaults to `TELEGRAM_BOT_TOKEN`. Without the chat ID, alerts are
+only logged.
+
+```bash
+cp launchd/com.angloedge-pipeline.sitecheck.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.angloedge-pipeline.sitecheck.plist
+```
 
 ### RNS announcements
 

@@ -389,23 +389,18 @@ def _git(repo_path, *args):
     return result.stdout.strip()
 
 
-def commit_and_push(repo_path, branch, rel_paths, message, git=_git):
+def commit_and_push(repo_path, branch, rel_paths, message, git=_git, generated=None):
     """Stage and commit only rel_paths, then pull --rebase and push.
 
     Committing with an explicit pathspec means anything else already staged in
     the site repo is left alone. No weekend skip — this runs any day.
+    site_repo first clears a stuck rebase/merge and, on a conflict confined to
+    `generated` (default: rel_paths), keeps this run's version.
     """
-    git(repo_path, "add", "-A", "--", *rel_paths)
-    try:
-        git(repo_path, "commit", "-m", message, "--", *rel_paths)
-    except RuntimeError as e:
-        if "nothing to commit" in str(e).lower() or "nothing added" in str(e).lower():
-            log("  ℹ GitHub: no changes to commit")
-            return
-        raise
-    git(repo_path, "pull", "--rebase", "origin", branch)
-    git(repo_path, "push", "origin", branch)
-    log(f"  ✅ GitHub: pushed company data → {branch}")
+    import site_repo
+    if site_repo.commit_and_push(repo_path, branch, rel_paths, message,
+                                 generated if generated is not None else list(rel_paths), git=git):
+        log(f"  ✅ GitHub: pushed {', '.join(rel_paths)} → {branch}")
 
 
 # ── export ───────────────────────────────────────────────────
@@ -426,8 +421,11 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     # against are the latest (e.g. hand-corrected slugs). A stale clone would
     # otherwise write old-slug files and hit rebase conflicts on push.
     # Skipped for --dry-run (no side effects) and --limit (local test mode).
+    import site_repo
+    generated = site_repo.generated_paths(companies_rel)
     if not dry_run and limit is None:
-        git(repo_path, "pull", "--rebase", "--autostash", "origin", branch)
+        site_repo.recover(repo_path, generated, git)
+        site_repo.sync(repo_path, branch, generated, git)
 
     # Newswire / commentary feeds get no company page (excluded_accounts.py);
     # an existing page is pruned below like any company that no longer qualifies.
@@ -527,7 +525,8 @@ def export_companies(rows, repo_path, companies_rel, branch="main",
     if touched and not dry_run:
         n = summary["new"] + summary["changed"]
         message = f"companies: {n} updated, {summary['pruned']} pruned ({summary['exported']} total)"
-        commit_and_push(repo_path, branch, [companies_rel, index_rel, map_rel], message, git=git)
+        commit_and_push(repo_path, branch, [companies_rel, index_rel, map_rel], message, git=git,
+                        generated=generated)
         summary["committed"] = True
     elif touched:
         log(f"  ℹ Would commit and push {touched} change(s){tag}")
@@ -577,18 +576,23 @@ def main():
         log(f"❌ GITHUB_REPO_PATH '{repo_path}' is not a git repository")
         sys.exit(1)
 
-    init_db()
-    rows = get_rns_for_export()
-    log(f"🏢 Exporting companies from {len(rows)} RNS announcement(s)"
-        + (" [DRY RUN]" if dry_run else "") + "...")
-
+    import alerts
+    alerting = not dry_run and limit is None
     try:
+        init_db()
+        rows = get_rns_for_export()
+        log(f"🏢 Exporting companies from {len(rows)} RNS announcement(s)"
+            + (" [DRY RUN]" if dry_run else "") + "...")
         summary = export_companies(rows, repo_path, companies_rel, branch=branch,
                                    dry_run=dry_run, limit=limit)
-    except RuntimeError as e:
+    except Exception as e:       # any failure: the site would silently go stale
         log(f"❌ Company export failed: {e}")
+        if alerting:
+            alerts.failure("companies-export", f"Company export failed: {e}")
         sys.exit(1)
     log_summary(summary, dry_run)
+    if alerting:
+        alerts.resolved("companies-export")
 
 
 if __name__ == "__main__":

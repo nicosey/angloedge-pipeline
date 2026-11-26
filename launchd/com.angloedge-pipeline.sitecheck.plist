@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.angloedge-pipeline.sitecheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline &amp;&amp; /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 site_repo.py --check</string>
+    </array>
+
+    <!-- Weekdays at 18:00 UK time, after the 16:45 digest and the 17:30 export: alerts
+         (TELEGRAM_CHAT_ID_ALERTS) if the site clone is stuck or either job hasn't
+         reached origin in 30 hours. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/sitecheck.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/m4server/projects/angloedge-pipeline/logs/sitecheck.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

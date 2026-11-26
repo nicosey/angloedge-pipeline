@@ -9,7 +9,7 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>cd /Users/m4server/projects/angloedge-pipeline && python3 briefing.py robotics && python3 publish.py</string>
+        <string>cd /Users/m4server/projects/angloedge-pipeline &amp;&amp; python3 briefing.py robotics &amp;&amp; python3 site_repo.py --repair &amp;&amp; python3 publish.py</string>
     </array>
 
     <key>StartCalendarInterval</key>

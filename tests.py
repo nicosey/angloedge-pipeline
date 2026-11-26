@@ -818,9 +818,9 @@ class TestExportCompanies(unittest.TestCase):
 
     def test_commits_and_pushes_only_export_paths(self):
         self._run(self._rows())
-        subcommands = [c.args[1] for c in self.git.call_args_list]
-        self.assertEqual(subcommands, ["pull", "add", "commit", "pull", "push"])
-        commit_args = self.git.call_args_list[2].args
+        calls = [c for c in self.git.call_args_list if c.args[1] not in READ_ONLY_GIT]
+        self.assertEqual([c.args[1] for c in calls], ["pull", "add", "commit", "pull", "push"])
+        commit_args = calls[2].args
         self.assertIn(self.COMPANIES, commit_args)
         self.assertIn("--", commit_args)
 
@@ -830,7 +830,8 @@ class TestExportCompanies(unittest.TestCase):
         s = self._run(self._rows())
         self.assertEqual(s["new"] + s["changed"], 0)
         self.assertEqual(s["unchanged"], 1)
-        self.assertEqual([c.args[1] for c in self.git.call_args_list], ["pull"])
+        self.assertEqual([c.args[1] for c in self.git.call_args_list if c.args[1] not in READ_ONLY_GIT],
+                         ["pull"])
 
     def test_pulls_before_reading_and_aborts_if_pull_fails(self):
         self.git.side_effect = RuntimeError("cannot pull with rebase")
@@ -1731,7 +1732,7 @@ class TestRnsDigest(unittest.TestCase):
             self.assertIn(("add", "-A", "--", "src/data/announcements-today.json"), calls)
             self.assertTrue(any(c[0] == "push" for c in calls))
             rc, calls2, _ = self._run([], tmp)                     # same content again
-            self.assertEqual(calls2, [])
+            self.assertEqual([c[0] for c in calls2 if c[0] not in READ_ONLY_GIT], ["pull"])
 
     def test_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1817,6 +1818,9 @@ class TestOutsideTerms(unittest.TestCase):
 
 
 # ── v3: excluded accounts, debt routine, history, parallel ───
+
+READ_ONLY_GIT = ("rev-parse", "diff")
+
 
 def _seed_full(rows):
     """rows: dicts with rns_number, timestamp, ticker, headline and optional company_name, url, category."""
@@ -2060,6 +2064,196 @@ class TestThroughput(unittest.TestCase):
                 con.close()
         self.assertEqual(sorted(out), [1, 2])
         self.assertEqual(len(calls), 1 + 4 * 2)            # warm-up + each prompt per setting
+
+
+# ── site repo resilience (real git repos) ───────────────────
+
+class TestSiteRepo(unittest.TestCase):
+    """Reproduces the stuck-rebase incident with a bare origin and two clones:
+    'server' (where the jobs run) and 'elsewhere' (another pusher)."""
+
+    DIGEST = "src/data/announcements-today.json"
+    GEN = ["src/data/companies/", "src/data/companies-index.json", DIGEST]
+
+    def setUp(self):
+        import subprocess
+        self.sp = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.tmp.name
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        self.origin = os.path.join(t, "origin.git")
+        self.run_git(t, "init", "-q", "--bare", "-b", "main", self.origin)
+        seed = os.path.join(t, "seed")
+        self.run_git(t, "clone", "-q", self.origin, seed)
+        self.write(seed, "README.md", "site\n")
+        self.write(seed, "src/content/briefings/a.md", "briefing a\n")
+        self.run_git(seed, "add", "-A")
+        self.run_git(seed, "commit", "-q", "-m", "init")
+        self.run_git(seed, "push", "-q", "origin", "HEAD:main")
+        self.server = os.path.join(t, "server")
+        self.elsewhere = os.path.join(t, "elsewhere")
+        for d in (self.server, self.elsewhere):
+            self.run_git(t, "clone", "-q", self.origin, d)
+        self.patches = [patch("site_repo.log"), patch("export_companies.log")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def run_git(self, cwd, *args, check=True):
+        r = self.sp.run(["git", *args], cwd=cwd, env=self.env, capture_output=True, text=True)
+        if check and r.returncode:
+            raise RuntimeError(r.stderr or r.stdout)
+        return r.stdout.strip()
+
+    def git(self, repo, *args):                      # same contract as export_companies._git
+        r = self.sp.run(["git", "-C", repo, *args], env=self.env, capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"git {args} failed")
+        return r.stdout.strip()
+
+    def write(self, repo, rel, text):
+        p = os.path.join(repo, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+
+    def commit(self, repo, rel, text, push=False):
+        self.write(repo, rel, text)
+        self.run_git(repo, "add", "--", rel)
+        self.run_git(repo, "commit", "-q", "-m", f"edit {rel}")
+        if push:
+            self.run_git(repo, "push", "-q", "origin", "HEAD:main")
+
+    def origin_file(self, rel):
+        return self.run_git(self.elsewhere, "show", f"origin/main:{rel}") if \
+            not self.run_git(self.elsewhere, "fetch", "-q", "origin") else None
+
+    def stuck_on(self, rel, mine="server\n", theirs="elsewhere\n"):
+        """Leave the server clone mid-rebase with a both-added conflict on rel."""
+        self.commit(self.elsewhere, rel, theirs, push=True)
+        self.commit(self.server, rel, mine)
+        r = self.sp.run(["git", "pull", "--rebase", "origin", "main"], cwd=self.server,
+                        env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        import site_repo
+        st = site_repo.state(self.server, self.git)
+        self.assertEqual((st["in_progress"], st["unmerged"]), ("rebase", [rel]))
+
+    def test_incident_stuck_rebase_on_generated_file_recovers_and_publishes(self):
+        import site_repo
+        self.stuck_on(self.DIGEST)
+        msg = site_repo.recover(self.server, self.GEN, self.git)
+        self.assertIn("rebase", msg)
+        self.assertEqual(site_repo.state(self.server, self.git), {"in_progress": None, "unmerged": []})
+        # Next run of the job: writes its newer output and publishes it.
+        self.write(self.server, self.DIGEST, "server v2\n")
+        self.assertTrue(site_repo.commit_and_push(self.server, "main", [self.DIGEST], "announcements: x",
+                                                  self.GEN, self.git))
+        self.assertEqual(self.origin_file(self.DIGEST), "server v2")
+        self.assertEqual(self.origin_file("src/content/briefings/a.md"), "briefing a")
+
+    def test_push_race_conflict_on_generated_file_keeps_this_runs_version(self):
+        import site_repo
+        self.commit(self.elsewhere, self.DIGEST, "elsewhere\n", push=True)
+        self.write(self.server, self.DIGEST, "server\n")
+        site_repo.commit_and_push(self.server, "main", [self.DIGEST], "announcements: x", self.GEN, self.git)
+        self.assertEqual(self.origin_file(self.DIGEST), "server")
+        self.assertEqual(site_repo.state(self.server, self.git), {"in_progress": None, "unmerged": []})
+
+    def test_their_deletion_vs_our_edit_resolved(self):
+        import site_repo
+        rel = "src/data/companies/acme-acm.json"
+        self.commit(self.elsewhere, rel, "v1\n", push=True)
+        self.run_git(self.server, "pull", "-q", "origin", "main")
+        self.run_git(self.elsewhere, "rm", "-q", rel)
+        self.run_git(self.elsewhere, "commit", "-q", "-m", "prune")
+        self.run_git(self.elsewhere, "push", "-q", "origin", "HEAD:main")
+        self.write(self.server, rel, "v2\n")
+        site_repo.commit_and_push(self.server, "main", ["src/data/companies"], "companies: x", self.GEN, self.git)
+        self.assertEqual(self.origin_file(rel), "v2")
+
+    def test_conflict_outside_generated_data_is_left_for_a_human(self):
+        import site_repo
+        self.stuck_on("src/content/briefings/b.md")
+        with self.assertRaises(site_repo.SiteRepoError) as cm:
+            site_repo.recover(self.server, self.GEN, self.git)
+        self.assertIn("briefings/b.md", str(cm.exception))
+        self.assertEqual(site_repo.state(self.server, self.git)["in_progress"], "rebase")   # untouched
+
+    def test_slug_map_is_not_auto_resolved(self):
+        import site_repo
+        self.assertFalse(site_repo.is_generated("src/data/company-slugs.json", self.GEN))
+        self.assertTrue(site_repo.is_generated("src/data/companies/x.json", self.GEN))
+        gen = site_repo.generated_paths("src/data/companies")
+        self.assertIn("src/data/announcements-today.json", gen)
+        self.assertTrue(all("slug" not in g for g in gen))
+
+    def test_check_reports_stuck_clone_and_stale_commits(self):
+        import site_repo
+        self.stuck_on(self.DIGEST)
+        problems = site_repo.check(self.server, "main", self.GEN, self.git, now=datetime(2026, 11, 26, 19, 0))
+        self.assertTrue(any("mid-rebase" in p for p in problems))
+        self.assertTrue(any("'companies:'" in p for p in problems))
+
+
+class TestAlerts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.p = [patch("alerts.ALERT_DIR", self.tmp.name), patch("alerts.log")]
+        for p in self.p:
+            p.start()
+        self.sent = []
+        self.send = lambda text: self.sent.append(text) or True
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_alerts_once_then_repeats_on_change_or_after_interval_then_recovers(self):
+        import alerts
+        t0 = datetime(2026, 11, 24, 17, 30)
+        alerts.failure("digest", "conflict", now=t0, send=self.send)
+        alerts.failure("digest", "conflict", now=t0.replace(hour=18), send=self.send)
+        self.assertEqual(len(self.sent), 1)
+        alerts.failure("digest", "other error", now=t0.replace(hour=19), send=self.send)
+        self.assertEqual(len(self.sent), 2)
+        alerts.failure("digest", "other error", now=t0.replace(day=25, hour=8), send=self.send)
+        self.assertEqual(len(self.sent), 3)
+        self.assertIn("4 run(s)", self.sent[-1])
+        alerts.resolved("digest", send=self.send)
+        self.assertIn("Recovered", self.sent[-1])
+        alerts.resolved("digest", send=self.send)                 # nothing to recover from
+        self.assertEqual(len(self.sent), 4)
+
+    def test_message_is_html_escaped(self):
+        import alerts
+        alerts.failure("companies-export", "error: <stdin> & co", send=self.send)
+        self.assertIn("&lt;stdin&gt; &amp; co", self.sent[0])
+
+    def test_without_alert_chat_only_logs(self):
+        import alerts
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID_ALERTS": ""}):
+            self.assertFalse(alerts._send("x"))
+
+    def test_digest_failure_alerts(self):
+        import rns_digest as d
+        with tempfile.TemporaryDirectory() as repo:
+            os.makedirs(os.path.join(repo, ".git"))
+            with patch.dict(os.environ, {"GITHUB_REPO_PATH": repo}), \
+                 patch.object(d, "_run", side_effect=__import__("sqlite3").OperationalError("database is locked")), \
+                 patch.object(d.db, "init_db"), \
+                 patch.object(d.db, "_connect", side_effect=lambda: __import__("sqlite3").connect(":memory:")), \
+                 patch.object(d, "rows_for_day", return_value=[]), patch("rns_digest.log"), \
+                 patch("alerts._send", side_effect=self.send):
+                self.assertEqual(d.main([]), 1)
+        self.assertIn("database is locked", self.sent[0])
 
 
 class TestGitHubConnection(unittest.TestCase):
